@@ -1,756 +1,542 @@
-# HisFree: Training-Free Historicalization of Foundation Models
+# HisFree: Where Does Historical Reading Live?
 
-**Literature review status:** updated 10 November 2026. The assessment below prioritizes peer-reviewed ACL Anthology papers, official datasets/repositories, and the original Weight-Space Programming reports. The WSP literature is unusually new: the initiating report appeared on 2 November 2026 and most independent follow-ups are currently preprints, so their results should be treated as promising but not yet settled.
+**Compiling historical reading behaviors from context into weights without gradients, and predicting when it works**
+
+**Version:** 0.2 (revised 10 November 2026 after a novelty and feasibility review)
+
+**Companion document:** [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) v0.2 gives the executable design (data construction, route specifications, diagnostics, metrics, thresholds, and the Phase 0 checklist).
+
+## 0. What changed from v0.1 and why
+
+v0.1 framed HisFree as a pipeline: Training-Free GRPO discovers a historical reading prior, Weight-Space Programming (WSP) then compiles it into a sparse edit, and the result is evaluated across text, OCR, page images, many tasks, and many model families. A review found four problems with that framing.
+
+| Problem in v0.1 | Evidence | Change in v0.2 |
+|---|---|---|
+| "Learn an experience prior, then compile it into weights" was presented as open | Online Experiential Learning (Ye et al., 2026) and EDGE (Xie et al., EMNLP 2026) already distill extracted experience into weights; Prompt Baking and context distillation already move prompt effects into weights | The novelty claim is narrowed to **gradient-free** compilation and to **predicting compilability**. Gradient-based context distillation becomes a reference upper bound rather than a missing baseline |
+| No convincing reason to avoid gradients | A LoRA or context-distillation run on ~100 examples costs minutes on one GPU for a 4B–9B model; a frontier-model WSP editor probably costs more | Section 3.7 states what gradient-free compilation must buy (inspectability, edit size, attribution) and drops "cheaper than training" as a claim |
+| The core hypothesis was likely to fail as stated | Published WSP successes repair a single localized pathology; a 600-token conditional reading strategy is probably distributed | The paper now studies a **spectrum of behaviors** chosen to differ in predicted locality, so both success and failure are informative |
+| Scope far beyond a 12-week project | 3 tasks × 4 views × 9 arms × 7 extra baselines × 5 trajectories × several model families, plus multimodal and a private blind set | One primary behavior, one or two contrast behaviors, two model families, text only. Multimodal work moves to a follow-up paper |
+
+Training-Free GRPO remains in the project, but as one **source** of prompt behavior to compile, not as the central method. That avoids a paper that reads as "method A plus method B applied to domain C."
 
 ## 1. Project summary
 
-**HisFree** investigates whether general-purpose language and vision-language models already contain useful historical-language and historical-document capabilities that are not reliably expressed at inference time, and whether those capabilities can be improved through a low-cost combination of **Training-Free GRPO-style experience search** and **bounded, gradient-free weight editing** rather than continued pretraining or supervised fine-tuning.
+Modern open language models can often behave like careful historical readers when prompted: preserve archaic spellings instead of modernizing them, quote evidence from a noisy OCR passage before answering, or read a word in its period sense. Without the prompt, they frequently do not. The prompt therefore unlocks a behavior that the weights already support.
 
-The central question is:
+HisFree asks:
 
-> Can group-relative, inference-only experience search discover a reusable historical reading strategy, and can that strategy be compiled into a small persistent weight edit without backpropagation or conventional training?
+> For a historical reading behavior that a model already exhibits under a prompt, can that behavior be moved into the weights without gradients, and which measurable properties of the behavior predict whether it can?
 
-Historical corpora are a particularly demanding test bed because they combine several forms of distribution shift:
+The working thesis is:
 
-- diachronic changes in spelling, syntax, vocabulary, meaning, and genre;
-- OCR noise and uncertain diplomatic transcription;
-- historical fonts, page degradation, multi-column layouts, marginalia, and illustrations;
-- duplicated editions and reprints that complicate contamination control;
-- long-tail people, places, events, and publication metadata;
-- modernizing biases, where a model silently replaces historical evidence with a plausible modern form.
+> Behaviors whose prompt effect is concentrated in a few directions and layers, such as suppressing a learned modernization prior, can be compiled into small gradient-free edits that retain most of the prompt's gain. Procedural behaviors whose prompt effect is spread across many layers and steps, such as evidence-first answering, cannot be compiled this way and belong in context or retrieval. Gradient-based context distillation can compile both, which isolates what is lost by removing gradients.
 
-The intended outcome is not merely an OCR corrector. It is a general historical model that can support retrieval, question answering, entity and event extraction, temporal and genre classification, diachronic semantic analysis, page understanding, transcription, and evidence-grounded generation.
+This thesis is falsifiable in both directions. If locality does not predict retention, or if gradient-free compilation matches gradient-based distillation everywhere, the paper reports that instead.
 
-## 2. Terminology and scope
+### 1.1 Why historical text
 
-The phrase *training-free* needs a precise operational definition. This project combines two mechanisms that are both gradient-free but operate at different levels:
+Historical text is used as a **controlled testbed**, not as the whole contribution.
 
-1. **Training-Free GRPO:** the target model remains frozen; groups of rollouts are compared, and their relative semantic advantages are distilled into natural-language experiential knowledge used as a token prior in later calls.
-2. **Weight editing:** a reasoning model or closed-form procedure converts a validated behavioral correction into a bounded parameter change, without target-model gradients or an optimizer.
+- **Paired views.** The same content exists as normalized text, diplomatic transcription, raw OCR, and synthetically corrupted OCR. That makes it possible to hold meaning fixed and vary only form, which few other domains allow.
+- **A clean "knows but does not express" case.** Models read *shew*, *publick*, *compleat*, and long-s forms correctly, yet they rewrite them as modern spellings when transcribing or correcting. The knowledge is present and the output prior suppresses it. That is exactly the kind of failure an edit could plausibly remove.
+- **Deterministic metrics.** Historical-form preservation, modernization-error rate, CER against a diplomatic gold, and evidence-span F1 can all be computed without an LLM judge.
+- **A useful application.** Digital-humanities users need models that do not silently modernize evidence. A compiled model that preserves historical forms without a long system prompt is directly usable.
 
-Across the complete pipeline, training-free therefore means:
+## 2. Terminology
 
-- no gradient computation or backpropagation through the target model;
-- no optimizer-driven update of the target model;
-- no conventional supervised fine-tuning or continued language-model pretraining;
-- candidate edits may be proposed by an external reasoning model and evaluated with a bounded number of forward passes;
-- the target model's parameters may be changed directly, subject to strict edit-size and regression constraints.
+**Gradient-free compilation.** A persistent parameter change computed without backpropagation through the target model and without an optimizer. Allowed computations are forward passes, closed-form solutions (least squares, ridge regression, projections), and edits proposed by an external reasoning model and checked with forward passes. This is not data-free or compute-free.
 
-This is therefore more accurately described as **gradient-free, optimizer-free adaptation through semantic experience search and forward-feedback weight editing**. It is not data-free, feedback-free, or compute-free. Training-Free GRPO is also not vanilla GRPO: it borrows group-relative exploration and comparison, but replaces numerical policy-gradient updates with a semantic experience/token-prior update.
+**Behavior source.** The prompt or context that induces the target behavior: a manual instruction, few-shot demonstrations, a directly generated instruction, or a Training-Free GRPO experience prior `E*`.
 
-The initial scope is English historical material, with text-only experiments first and multimodal page-image experiments second. Multilingual evaluation is desirable because it tests whether the method repairs general historical representations rather than overfitting English orthography.
+**Prompt gain.** `Gain_P = Score(model + prompt) − Score(model)` on held-out data.
 
-## 3. Background
-
-### 3.1 Historical language models
-
-Existing work largely follows one of three strategies.
-
-1. **Pretraining from scratch on historical text.** MacBERTh was pretrained on English from 1450--1950 and showed that historical pretraining can outperform adapting a contemporary model on several downstream tasks. More recently, TypewriterLM was pretrained as a 7.24B-parameter model on a 54B-token, pre-1913 corpus and introduced temporally aligned instruction tuning and evaluation. These results demonstrate the value of temporal grounding, but require substantial data curation and training compute.
-
-2. **Continued pretraining/domain adaptation.** Historical variants of BERT and related models improve after additional masked-language-model training on period-specific corpora. This is effective but still relies on gradient training and can entangle historical adaptation with catastrophic forgetting or temporal leakage.
-
-3. **Pixel- or image-based historical models.** PHD adapts PIXEL into a general-purpose, OCR-free encoder of historical documents. It pretrains on synthetic historical scans and real newspapers from 1700--1900, reconstructs masked image patches, and evaluates language understanding, semantic search, and historical question answering. PHD establishes that page images can carry both linguistic and document-structural information, but it is an encoder trained with continued pretraining rather than a training-free historicalization method.
-
-These approaches provide strong baselines. They do not answer whether a modern, broadly pretrained language or multimodal model already contains comparable historical capability that can be elicited through localized parameter intervention.
-
-### 3.2 Model editing and weight-space interventions
-
-Model editing predates weight-space programming and contains several distinct paradigms. MEND trains a hypernetwork to transform task gradients into fast edits; SERAC stores corrections in an external memory and routes relevant inputs through a counterfactual model. ROME identifies and updates localized factual associations through rank-one changes to transformer MLP weights, while MEMIT extends direct editing to many factual associations. WISE separates frozen main memory from an editable side memory and highlights a practical tension among reliability, generalization, and locality. Task arithmetic represents behavior changes as directions between base and fine-tuned checkpoints, while activation engineering steers behavior at inference time without changing persistent weights. Unlike these approaches, WSP asks a general reasoning model to design the parameter intervention without a learned editor or target-model gradients.
-
-Weight-Space Programming (WSP) proposes a more agentic setting: a strong reasoning model inspects another model's architecture, weights, activations, and evaluation feedback, then writes targeted parameter edits without gradient descent. The initial WSP experiments reported that editing 0.016% of a small Qwen model's weights reduced reasoning loops and sharply improved several benchmarks. Crucially, the same study could not add mathematical ability to a model whose errors lacked a single localized obstruction. Recent follow-up work similarly finds substantial but inconsistent gains and often retains the original checkpoint when an edit cannot be validated.
-
-The most defensible interpretation is therefore:
-
-> Weight editing may remove a localized obstacle that hides an existing ability, but it should not be assumed to create missing domain knowledge or a missing modality from scratch.
-
-This distinction motivates HisFree. Historical competence may already be partly present because modern foundation models train on large web, book, PDF, and synthetic mixtures, and smaller open models may inherit capabilities through distillation. The project tests this hypothesis rather than assuming it.
-
-### 3.3 Research gap
-
-No established line of work currently combines all of the following:
-
-- systematic auditing of latent historical capability in modern open foundation models;
-- contamination-aware separation of memorization from historical-language generalization;
-- direct, gradient-free editing for broad domain adaptation rather than isolated factual replacement;
-- group-relative, inference-only discovery of historical reading strategies before parameter intervention;
-- conversion of a validated experience/prompt prior into a persistent edit, with prompt-only and edit-only ablations;
-- joint treatment of clean text, noisy OCR, page images, and metadata as views of the same historical object;
-- explicit preservation gates for modern/general capabilities;
-- evaluation across historical QA, information extraction, diachronic semantics, retrieval, and document understanding.
-
-HisFree should be framed around this gap, not around the weaker claim that applying an existing WSP recipe to ECCO is itself sufficient novelty.
-
-### 3.4 Progress of the field: 2021--2026
-
-The relevant literature has moved through five partially overlapping stages.
-
-| Period | Representative progress | What is now established | Remaining limitation for HisFree |
-|---|---|---|---|
-| 2021--2023 | MacBERTh, GHisBERT, continued historical pretraining | Historical-domain pretraining helps lexical and downstream NLP tasks | Mostly encoder models, text-only, and trained with gradients |
-| 2023--2024 | PHD, American Stories, large structured newspaper corpora | Page pixels, layout, and OCR noise can be modeled jointly; historical document modeling need not be OCR-only | PHD is an encoder and requires synthetic/real-image pretraining; broad generative historical reasoning remains untested |
-| 2024--2025 | CHURRO, LLM post-OCR studies, Training-Free GRPO, prompt-to-weight theory | Specialized VLM training can outperform frontier systems on historical transcription; semantic experience can adapt frozen APIs; prompt effects may be convertible into reusable edits | These results have not been combined or tested for broad historical capability |
-| 2026 | TypewriterLM, AncientDoc, ProHist-Bench, HisDoc-OCR, image-informed correction | Billion-scale History LMs and broad OCR-to-reasoning VLM benchmarks now exist; visual grounding and temporal leakage are first-class problems | These systems are trained or retrieval-based; none establishes gradient-free broad historicalization of a modern open model |
-| Nov. 2026 | WSP, WSP-Scope, WeightLoop, robot-policy editing | Extremely sparse edits can sometimes repair a localized failure and transfer beyond the exact edit task | Reliability is inconsistent, evidence is mostly preprint-level, and no study shows that WSP can create a broad missing domain capability |
-
-This timeline makes two claims unsafe. First, it is no longer accurate to present a general-purpose historical model as novel by itself: TypewriterLM is explicitly a History LM, and PHD/CHURRO are strong historical document models. Second, it is not yet justified to claim that WSP is a replacement for domain training. The novelty has to come from the **causal test of latent capability, bounded gradient-free intervention, and broad transfer evaluation**.
-
-### 3.5 What Weight-Space Programming has and has not demonstrated
-
-The original *Sparks of Weight-Space Programming* report edited 0.016% of Qwen3.5-0.8B to address a reasoning-loop pathology. Under the reported sampling setup, MATH-500 rose from 7.9% to 48.1%; the edit also improved instruction following. This is a striking result, but it is one target model, one diagnosed pathology, and an early technical report rather than a peer-reviewed study.
-
-The first follow-up evidence is informative:
-
-- **WSP-Scope** ran 16 editing trajectories over seven benchmarks and two Qwen scales. It found gains as large as 29.45 percentage points from only 1,023 modified parameters, but transfer was uneven and 6 of 16 trajectories correctly retained the original weights because an edit could not be validated.
-- **Robot policy repair** provides the cleanest analogy for historical orthography. Editing 65 token-embedding rows raised held-out instruction success from 86.3% to 92.0%, with 48 repairs and four regressions. Yet 12 of 13 further sessions declined an edit, and the authors explicitly conclude that the evidence supports lexical repair, not acquisition of missing robot skills.
-- **WeightLoop** shows that an LLM can write a reusable bounded editing program driven by subsequent experimental feedback. This expands WSP from a one-off edit into an update loop, but the application is a small prediction/discovery setting rather than a foundation-model domain conversion.
-- **Medical imaging WSP** found that LLM-written CNNs performed above chance, but Adam training on only 256 labeled images beat them on every MedMNIST task; one Astra result was systematically below chance. This is direct evidence against the strongest "no training data needed" interpretation.
-- A weight-reading audit found that apparent understanding can often be explained by local arithmetic plus priors about familiar datasets; label permutation broke semantic interpretations. Raw-weight access must therefore be separated experimentally from benchmark or architecture memorization.
-
-The broader model-editing literature is also cautionary. RippleEdits found that prominent editors fail to propagate edits consistently and that an in-context baseline performed best. Large-scale sequential editing causes forgetting and downstream degradation. *The Mirage of Model Editing* showed that a realistic QA evaluation reduced apparent single-edit performance from 96.8% to 38.5%, partly because common teacher-forced evaluations leak target content and length. RULE-EDIT further showed that near-perfect direct edit reliability can coexist with less than 52% instance portability and less than 26% rule understanding.
-
-**Implication for this project:** WSP is a credible mechanism for discovering and removing a shared bottleneck. It is not evidence that a model can absorb ECCO, COHA, or Gale as new parametric memory without training. HisFree must use archive data as diagnostic and validation evidence, while retrieval remains responsible for rare facts and document-specific memory.
-
-### 3.6 Current state of historical language and document models
-
-The strongest adjacent systems now cover several different meanings of "historical model":
-
-| Work | Model/data | Capability demonstrated | Why it does not subsume HisFree |
-|---|---|---|---|
-| MacBERTh (2021) | BERT-style encoder, English 1450--1950 | Historical lexical/linguistic downstream tasks | Trained from scratch; not generative or multimodal |
-| PHD (EMNLP 2023) | PIXEL-based encoder, synthetic scans plus 1700--1900 newspapers | OCR-free NLU, retrieval, and historical QA from rendered documents | Continued pixel pretraining; encoder-only; limited corpus/period coverage |
-| CHURRO (EMNLP 2025) | 3B VLM, 99,491 pages from 155 corpora, 46 language clusters | Strong open-weight multilingual historical text recognition | Specialized training; primarily transcription rather than general historical reasoning |
-| TypewriterLM (EMNLP 2026) | 7.24B decoder, 54B-token 1700--1913 corpus, trained for about 140B tokens | Temporally bounded generation, instruction following, cutoff evaluation | Expensive from-scratch pretraining; text-only; optimizes historical cutoff rather than adapting an existing modern model |
-| AncientDoc (ACL Findings 2026) | ~3,000 pages, >100 books, 14 Chinese document types | Benchmark from page OCR through translation and reasoning QA | Benchmark, not an adaptation method; different language/script but valuable external transfer test |
-| HisDoc-OCR (ACL Findings 2026) | Historical Chinese MLLM adaptation | Diagnoses language-prior domination and repairs visual grounding | Uses training-based layout injection, reweighting, and attention distillation |
-| ProHist-Bench (ACL 2026) | 400 expert questions, 10,891 rubrics, 18 evaluated LLMs | Professional historical/evidentiary reasoning remains difficult even for strong LLMs | Knowledge- and reasoning-heavy Chinese benchmark, not a page-reading model |
-
-TypewriterLM is particularly important because it weakens a simple "modern models have seen the archive, therefore no historical pretraining is necessary" claim. Its authors show that a strict temporal model requires aggressive filtering of modern metadata, a historical tokenizer, leakage-aware instruction tuning, and temporally aligned evaluation. Its general benchmark scores remain far below a modern Qwen3-4B baseline (for example, 43.3 versus 77.4 on ARC-Easy), illustrating a real trade-off between temporal grounding and modern general competence. HisFree should test whether a modern model can retain its general competence while acquiring **interpretive robustness**, not attempt to reproduce a strict historical knowledge cutoff through sparse editing.
-
-CHURRO and recent image-informed post-OCR work also make an OCR-only paper too narrow. CHURRO already reports a 3B specialized VLM across 22 centuries and 46 language clusters; image-plus-noisy-OCR prompting can sharply reduce transcription error. A competitive HisFree paper therefore needs at least one capability above transcription: evidence-grounded QA, entity/event extraction, diachronic meaning, retrieval, or historical reasoning.
-
-### 3.7 Evidence-based novelty verdict
-
-As of 10 November 2026, the project is **potentially novel, but only under a stricter formulation**.
-
-| Proposed claim | Verdict | Reason |
-|---|---|---|
-| "We build a historical language model" | Not novel enough | MacBERTh, PHD, CHURRO, TypewriterLM, and other History LMs already occupy this space |
-| "We use ECCO/COHA/Gale for historical adaptation" | Not novel enough | Domain pretraining, fine-tuning, OCR correction, and retrieval over historical archives are established |
-| "We apply WSP to historical text" | Weak novelty alone | This is a new application, but risks reading as technique transfer without a scientific insight |
-| "We apply Training-Free GRPO to historical prompts" | Weak-to-moderate novelty alone | It is a new domain application, but remains prompt/experience optimization unless it reveals a general mechanism |
-| "We learn a historical experience prior with Training-Free GRPO and compile it into weights" | Stronger and currently open | Closest work converts individual prompts/instructions to weights, but does not learn a broad historical strategy through group-relative feedback |
-| "We identify which historical failures are latent bottlenecks and repair them with sparse, gradient-free edits" | Stronger and currently open | No located work combines causal localization, WSP, historical data, and broad cross-corpus evaluation |
-| "We show when sparse edits fail and training/retrieval is necessary" | Strong scientific contribution | It establishes the boundary between capability elicitation and domain learning |
-| "One edit transfers across clean text, OCR, image, corpus, period, and task without general regression" | Potentially CCF B/A-level result | This would demonstrate a general principle rather than an archive-specific trick |
-
-The most defensible paper thesis is:
-
-> Modern foundation models possess uneven latent historical competence. Small, forward-validated weight interventions can repair some shared access and grounding failures, but cannot substitute for retrieval or pretraining when the underlying historical knowledge is absent.
-
-This is falsifiable and remains valuable if the final result is a carefully delimited negative result.
-
-### 3.8 Review-derived changes to the experimental design
-
-The literature implies five non-negotiable design changes:
-
-1. **Use free generation, never teacher forcing, for edit evaluation.** Otherwise edit success may be dramatically overstated.
-2. **Validate base knowledge before editing.** A model-specific a priori probe, similar in spirit to TRACE, should distinguish "knows but cannot express" from "does not know." Only the first class is a plausible WSP target.
-3. **Measure portability and ripple effects.** Every edit needs direct, paraphrase, derived-instance, neighboring-concept, and unrelated-task tests.
-4. **Include a no-edit decision and multiple independent trajectories.** The WSP literature shows that refusing an unvalidated edit is often the correct result.
-5. **Use matched non-parametric baselines.** Prompting, in-context correction, activation steering, and RAG sometimes beat parameter editing; the paper must show why a persistent weight change is warranted.
-
-### 3.9 Review scope and uncertainty
-
-This is a targeted state-of-the-field review, not a PRISMA-style systematic review. It covers the primary technical lines needed for the project: historical pretraining and continued adaptation, pixel/VLM historical document modeling, historical evaluation datasets, factual and conceptual model editing, activation/weight interventions, Training-Free GRPO and prompt optimization, prompt-to-weight conversion, and the November 2026 WSP wave. Peer-reviewed results are treated as stronger evidence than arXiv preprints; the original WSP blog and Training-Free GRPO paper are treated as motivating reports whose headline claims require independent replication. Because this literature is changing within days, these subsections should be refreshed before paper submission and all claimed reproductions should be tied to immutable code/checkpoint hashes.
-
-### 3.10 Training-Free GRPO and the experience-to-weight bridge
-
-Training-Free GRPO does not update model parameters. For each query it samples a group of outputs, evaluates their relative quality, and asks an LLM to express the **semantic advantage** of successful over unsuccessful trajectories as natural-language experiential knowledge. Across several epochs this experience becomes a learned token prior appended to later model calls. The initiating work reports gains on mathematical reasoning and web search using tens to roughly one hundred examples, including a WebWalkerQA pass@1 increase from 63.2% to 67.8%. Its evidence is currently a preprint/ICLR submission and centers on math and tool-using agents, not historical language.
-
-The reported policy models are large, so low-cost adaptation of a smaller open model is not yet established. HisFree should distinguish a **self-updater**, where the target model writes its own semantic advantages, from a **teacher-updater**, where a stronger external model summarizes grouped target-model rollouts. The latter may be more capable but shifts cost into API calls and can inject the teacher's own historical assumptions. Both the updater identity and its cost must therefore be ablated.
-
-This mechanism is highly relevant to historical documents because many failures are strategic rather than factual. Examples include silently normalizing archaic spelling, trusting language priors over damaged glyphs, ignoring page layout, or answering from modern world knowledge instead of cited evidence. A group comparison can turn these repeated failure contrasts into an interpretable historical reading policy before any risky parameter edit.
-
-Two adjacent lines make a hybrid plausible:
-
-- **Transmuting Prompts into Weights** derives token-independent thought vectors and matrices that convert prompt effects into reusable parameter updates.
-- **Closed-form instruction distillation** first finds a known-good rewording, then copies its internal effect into MLP weights. In a robot-policy experiment it improved held-out success from 27/128 to 106/128, but only when the base policy already possessed the skill and a working instruction existed.
-
-The resulting HisFree hypothesis is:
-
-> Training-Free GRPO can discover a known-good, corpus-level historical reading prior; WSP or closed-form prompt-to-weight distillation can then compile the stable part of that prior into a persistent, low-overhead edit.
-
-This produces a testable three-layer separation:
+**Retention ratio.** For a compiled model `Mc` evaluated **without** the prompt:
 
 ```text
-archive examples + reward signals
-            |
-            v
-Training-Free GRPO: discover semantic historical experience E*
-            |
-            +------> prompt-only historical model (frozen weights)
-            |
-            v
-WSP / closed-form compiler: E* -> bounded delta-theta
-            |
-            v
-edited historical model (no long experience prompt at inference)
+Retention(Mc) = (Score(Mc) − Score(M0)) / (Score(M0 + prompt) − Score(M0))
 ```
 
-The bridge is not guaranteed. Some experience may be too conditional to encode in a static edit, and prompt-to-weight methods can be dense despite a low-rank representation. Therefore the project must compare prompt-only, edit-only, and compiled variants, and treat a failed compilation as evidence that the behavior belongs in contextual memory rather than model weights.
+Retention is reported only where the prompt gain is significantly positive.
+
+**Compilability.** The best retention a compilation route achieves on a behavior under a fixed edit-size budget, subject to the preservation gate.
+
+**Locality diagnostics.** Measurements, taken before any edit, of how concentrated a prompt's effect is inside the model. They are defined in Section 6.4 and serve as candidate predictors of compilability.
+
+## 3. Background and related work
+
+### 3.1 Historical language and document models
+
+Existing work mostly builds historical capability through training.
+
+- **Pretraining from scratch.** MacBERTh (English, 1450–1950) showed that historical pretraining helps downstream tasks. TypewriterLM (Luo et al., EMNLP 2026) is a 7.24B decoder trained on a 54B-token pre-1913 corpus with temporally aligned instruction tuning. Its general benchmarks remain far below a modern model of similar size (for example 43.3 versus 77.4 for Qwen3-4B on ARC-Easy), which shows the cost of strict temporal grounding.
+- **Continued pretraining.** Historical BERT variants improve after period-specific masked-LM training. This works, but needs gradients and risks forgetting.
+- **Pixel and VLM models.** PHD (EMNLP 2023) adapts a pixel encoder to historical newspapers. CHURRO (EMNLP 2025) trains a 3B VLM on 99,491 pages from 155 corpora and outperforms frontier systems on historical transcription. HisDoc-OCR (ACL Findings 2026) diagnoses language-prior domination in Chinese historical OCR and repairs it with training.
+- **Benchmarks.** ChroniclingAmericaQA, HIPE-2022, SemEval-2020 Task 1, AncientDoc, and ProHist-Bench cover QA, entity linking, semantic change, OCR-to-reasoning, and professional historical reasoning.
+
+HisDoc-OCR is the closest diagnosis to ours. It finds that a strong language prior overrides visual evidence, which is the multimodal analogue of the modernization prior studied here. It repairs the problem with training, so it does not address gradient-free compilation.
+
+None of these works asks whether a prompted historical behavior can be moved into weights without gradients. Building a historical model is not novel by itself, and this project does not claim it.
+
+### 3.2 Model editing and activation interventions
+
+- **Locate-and-edit.** ROME and MEMIT make closed-form rank-one or multi-rank MLP edits for factual associations. AlphaEdit projects edits into a null space to protect other knowledge.
+- **Learned editors and memories.** MEND trains a hypernetwork. SERAC and WISE keep corrections in a separate memory.
+- **Activation steering.** Activation addition and related methods change hidden states at inference without persistent weight changes. Steering is the natural non-persistent reference for a compiled edit.
+- **Evaluation pitfalls.** RippleEdits shows that edits fail to propagate and that an in-context baseline is often best. *The Mirage of Model Editing* shows that teacher-forced evaluation inflates single-edit success from 38.5% to 96.8%. RULE-EDIT shows near-perfect direct reliability alongside under 52% portability. Large-scale sequential editing causes forgetting.
+
+Factual editors target single associations, whereas HisFree targets **behaviors**. That distinction matters for the locality hypothesis: a modernization prior may look more like a set of token-level associations, and evidence-first answering does not.
+
+### 3.3 Moving prompt or experience effects into weights (closest prior work)
+
+This is the line of work the paper must position against most carefully.
+
+| Work | Behavior source | Compilation | Gradients | Models and tasks | Relevance |
+|---|---|---|---:|---|---|
+| Context distillation (Snell et al., 2022) | Instructions and scratchpads | Fine-tune the student to match the prompted teacher | yes | Various LMs | Original prompt-to-weights idea |
+| Prompt Baking (Bhargava et al., 2024) | Any prompt | Minimize KL between prompted and baked model | yes | Instruction and reasoning prompts | Same goal, gradient-based |
+| Online Experiential Learning (Ye et al., 2026) | Experience extracted by the model from its own trajectories | On-policy context distillation with reverse KL | yes | Qwen3 1.7B–8B on Frozen Lake and Sokoban | Shows **experience** can be consolidated, sometimes exceeding the in-context gain (e.g. Sokoban 18.2 in context → 21.4 consolidated) |
+| EDGE (Xie et al., EMNLP 2026) | Retrieved experiences, split into conditioned and free rollouts inside a GRPO group | Reverse-KL distillation inside RL training | yes | Embodied, web, and search QA agents | Closest to the v0.1 pipeline; up to +12.5 points over RL baselines |
+| Transmuting Prompts into Weights (Mazzawi et al., 2025/2026) | Prompts and in-context examples | Closed-form least-squares "thought matrices" on MLP up/gate projections | no | Gemma 3 1B: arithmetic, detox, translation, capitals, synthetic dictionaries | The main gradient-free compiler to build on |
+| Distilling Instructions into Weights (Abbas and Seraj, 2026) | A known-good rewording | Closed-form MLP edit | no | Robot policy, 27/128 → 106/128 held-out success | Works only when the skill already exists and a working instruction is known |
+| WSP and follow-ups (2026) | Diagnosed failures | Edits proposed by a frontier reasoning model | no | Qwen3.5 0.8B and up, robot policies, small CNNs | Successes are localized repairs; many sessions correctly decline to edit |
+
+Two observations shape the project.
+
+1. **Experience-to-weights is no longer open as such.** OEL and EDGE already do it with gradients, and OEL reports consolidated performance at or above the in-context gain. A paper whose main claim is "we compile experience into weights" would be incremental.
+2. **Gradient-free compilation has uneven retention, and the pattern is unexplained.** In Transmuting Prompts, arithmetic retains 100% of the prompted score, detoxification and translation retain most of it, but Country→Capital drops from 79.0 with context to 47.6 when patched. No published work explains which properties of a prompt effect make it compilable without gradients, or tests this at 4B–9B scale on natural-language behaviors.
+
+The open question HisFree targets is therefore the second one.
+
+### 3.4 What Weight-Space Programming has and has not shown
+
+*Sparks of Weight-Space Programming* (Takehi, Teoh, Zhang, and Khattab, 2 November 2026) reports that a frontier model edited 0.016% of Qwen3.5-0.8B to remove a reasoning-loop pathology, raising MATH-500 from 7.9% to 48.1% under the reported sampling setup. The authors say WSP falls short when the problem is not a single localized fault.
+
+The first follow-ups support that caution.
+
+- **WSP-Scope** (Hu et al.) ran 16 trajectories on seven benchmarks and two Qwen3.5 scales. Gains reached 29.45 points from 1,023 parameters, but transfer was uneven, and 6 of 16 trajectories correctly kept the original weights.
+- **Robot policy repair** (Zhang et al.) raised held-out success from 86.3% to 92.0% by editing 65 token-embedding rows, but 12 of 13 further sessions declined to edit. The authors conclude the evidence supports lexical repair, not new skills.
+- **WeightLoop** (Li et al.) turns WSP into a reusable editing program driven by experimental feedback, in a small prediction setting.
+- **Medical imaging WSP** (Lindholz et al.) found LLM-written CNNs above chance, but Adam on 256 labeled images beat them on every MedMNIST task.
+- **A weight-reading audit** (Ahmed) found that apparent weight understanding is often local arithmetic plus dataset priors.
+
+Implication: WSP is a credible tool for removing a **lexical or localized** obstruction, which is why B1 below is the primary target. It is not evidence that a distributed procedure can be written into weights. The robot-policy result, a lexical repair through embedding rows, is the closest analogue to suppressing modernized spellings.
+
+### 3.5 Training-Free GRPO
+
+Training-Free GRPO (Cai et al., 2025) keeps the model frozen. For each query it samples a group of outputs, compares them, and asks an LLM to state the semantic advantage of the better outputs as natural-language experience, which accumulates into a prompt prior. It reports gains on math and web search with tens to about one hundred examples, using large policy models such as DeepSeek-V3.1.
+
+In v0.2 Training-Free GRPO is one behavior source among several. Its role is to test a secondary question: does a group-discovered experience, which tends to be longer and more conditional than a manual instruction, compile better or worse than a short manual instruction with a similar prompt gain? Its effectiveness on 4B–9B targets is not established, and a self-updater may produce weak experience. A teacher-updater is allowed but must be reported as such.
+
+### 3.6 Progress of the field, 2021–2026
+
+| Period | Representative progress | What is now established | Remaining gap for HisFree |
+|---|---|---|---|
+| 2021–2023 | MacBERTh, historical continued pretraining, PHD | Historical pretraining helps; page pixels can be modeled | All gradient-trained |
+| 2022–2024 | Context distillation, Prompt Baking, ROME/MEMIT | Prompt effects can be moved into weights with gradients; factual associations can be edited in closed form | Behavior-level, gradient-free compilation is untested |
+| 2025 | CHURRO, Training-Free GRPO, Transmuting Prompts | Specialized historical VLMs; frozen-model experience learning; closed-form prompt-to-weight on a 1B model | Retention varies by task with no explanation |
+| 2026 (H1) | TypewriterLM, OEL, HisDoc-OCR, AncientDoc, ProHist-Bench | Billion-scale history LMs; experience consolidation into weights with gradients; language-prior domination diagnosed in historical OCR | No gradient-free compilation of historical behaviors |
+| 2026 (Oct–Nov) | EDGE, WSP, WSP-Scope, robot WSP, WeightLoop | Experience distillation inside RL; sparse frontier-model edits sometimes repair localized failures | No account of which behaviors are compilable without gradients |
+
+### 3.7 Why compile without gradients at all
+
+This is the first question reviewers will ask, and the paper must answer it directly. The honest answer is **not** "it is cheaper than training": for a 4B–9B model and about 100 examples, LoRA or context distillation is cheap, and a frontier-model WSP editor may cost more.
+
+What gradient-free compilation can offer, and what the paper will measure:
+
+1. **Attribution.** A closed-form or agentic edit is written in terms of named components: specific embedding rows, a rank-k update to specific MLP layers, specific directions. If a small edit retains most of the prompt's gain, that localizes where the behavior lives. A gradient-trained LoRA spread across all layers does not give this answer.
+2. **Edit size and composability.** If gradient-free edits are orders of magnitude smaller than a LoRA with similar retention, they can be stored, inspected, reverted, and combined per behavior.
+3. **No training stack.** Closed-form compilation needs only forward passes and a linear solve, so it can run where fine-tuning infrastructure is unavailable. This is a secondary practical point, not a headline.
+4. **A scientific probe.** The gap between gradient-free and gradient-based retention on the same behavior measures how much the behavior depends on distributed, jointly optimized changes. That gap is the quantity the locality hypothesis predicts.
+
+Gradient-based context distillation (LoRA, OEL-style on-policy distillation) is therefore a required **reference**. The paper reports retention for both, plus edit size and cost, and does not claim gradient-free compilation is better overall.
+
+### 3.8 Novelty verdict (revised)
+
+| Claim | Verdict | Reason |
+|---|---|---|
+| "We build a historical language model" | Not novel | MacBERTh, PHD, CHURRO, TypewriterLM |
+| "We compile a learned experience prior into weights" | Not novel | OEL, EDGE, Prompt Baking, context distillation |
+| "We apply WSP or Training-Free GRPO to historical text" | Weak alone | An application, likely to be crowded by the WSP wave within months |
+| "Gradient-free compilation of historical reading behaviors at 4B–9B scale" | Moderate | New setting for Transmuting-Prompts-style compilers; needs the comparison against gradient-based distillation to be meaningful |
+| "Measurable locality of a prompt's effect predicts gradient-free compilability across behaviors and model families" | **Strongest; currently open** | No located work explains why retention varies (e.g. capitals versus arithmetic in Transmuting Prompts) |
+| "Modernization bias in historical transcription is a localized output prior that a tiny edit can remove" | Strong, specific, and checkable | Connects to HisDoc-OCR's language-prior diagnosis and to the lexical-repair evidence from robot WSP |
+| "Procedural historical reading cannot be compiled without gradients and belongs in context" | Strong if supported | Establishes a boundary rather than a headline gain |
+
+The paper thesis:
+
+> A historical reading behavior can be compiled into weights without gradients in proportion to how concentrated its prompt effect is. Modernization suppression is concentrated and compiles into a tiny edit; evidence-first answering is distributed and does not. Gradient-based distillation compiles both, and the gap between the two quantifies the cost of removing gradients.
+
+### 3.9 Timing risk
+
+WSP appeared on 2 November 2026, and more than seven follow-ups were on arXiv within a week. By the next ACL Rolling Review deadlines there will be many "WSP for domain X" papers. A paper whose contribution is applying WSP to a new domain is likely to be scooped or judged incremental. The locality-predicts-compilability framing does not depend on being first to apply WSP, which makes it more robust to this competition. The schedule in Section 8 is still built to produce a submittable result quickly.
 
 ## 4. Research questions and hypotheses
 
-### RQ1: How much historical capability is already present?
+### RQ1: Is there prompt-accessible headroom?
 
-Measure current open language and vision-language models on clean historical text, raw OCR, page images, and combined image-plus-text input.
+**H1.** On diplomatic transcription and correction of historical text, a current 4B–9B open model makes frequent modernization errors without a special prompt, and a short instruction removes a large share of them. Under raw OCR, evidence-first prompting improves evidence-span F1 in historical QA.
 
-**H1.** Modern models will perform well on clean historical text and common historical knowledge, but will show larger degradation on rare genres, raw pages, OCR noise, temporally shifted word meanings, and exact evidence localization.
+This is the kill test. Without prompt headroom there is nothing to compile.
 
-### RQ2: Are failures localized bottlenecks or missing knowledge?
+### RQ2: How much prompt gain survives gradient-free compilation?
 
-Use controlled input contrasts, activation probes, causal interventions, and edit attempts to distinguish representation failures from genuinely absent knowledge.
+**H2.** For the primary behavior B1, at least one gradient-free route retains at least 50% of the prompt gain at an edit size of at most 0.1% of parameters, while passing the preservation gate. For the contrast behavior B3, gradient-free retention is substantially lower than for B1, while gradient-based distillation retains most of the gain for both.
 
-**H2.** A meaningful subset of historical failures will be attributable to localized bottlenecks in token embeddings, early/middle MLP directions, visual projection, or cross-modal alignment. Long-tail factual knowledge will be less editable and will remain better handled by retrieval.
+### RQ3: Does locality predict compilability?
 
-### RQ3: Can experience search plus bounded editing improve broad historical capability?
+**H3.** Locality diagnostics measured **before** editing (layer concentration of the prompt effect, effective rank of the prompted-minus-unprompted activation delta, and the share of the effect recovered by patching the top-k components) rank behaviors in the same order as their gradient-free retention, across at least two model families.
 
-Use Training-Free GRPO to learn a semantic historical experience prior, then ask whether WSP or closed-form distillation can compile its transferable effect into small, reversible changes to selected parameter regions.
+Pre-registered predicted order: B1 (modernization suppression) > B2 (period word sense, optional) > B3 (evidence-first answering).
 
-**H3.** The learned experience prior will outperform a manually written prompt, and a constrained edit distilled from that prior will retain part of its gain across multiple historical tasks while reducing per-query prompt overhead.
+### RQ4: Does the behavior source matter?
 
-### RQ4: Do edits transfer?
+**H4.** For prompts with matched prompt gain, a short manual instruction compiles with higher retention than a longer Training-Free GRPO experience prior, because the experience prior encodes more conditional, procedural content. This is secondary and may be dropped if Training-Free GRPO does not produce a prompt gain on the target model.
 
-Evaluate across corpora, time periods, genres, model families, and modalities.
+### RQ5: Does a compiled edit transfer and preserve general ability?
 
-**H4.** A genuine historicalization edit should transfer beyond the corpus and task used to propose it. Corpus-specific gains without cross-corpus transfer should be classified as overfitting, not historicalization.
+**H5.** A compiled B1 edit transfers to an unseen corpus and an unseen period, beats norm-, layer-, and size-matched random edits, and stays within the general-regression tolerance.
 
-### RQ5: What is the cost of historicalization?
+## 5. Behaviors under study
 
-Measure rollout budget, experience-prompt length, edit size, forward-pass budget, editor cost, amortized inference cost, variance across runs, and regression on modern tasks.
+Behaviors are chosen to span the predicted locality spectrum, so that both positive and negative compilation results are informative.
 
-**H5.** The useful operating point is a Pareto frontier between historical gain, general-capability retention, rollout cost, edit sparsity, and amortized inference cost rather than a single aggregate score.
+### B1 (primary): Historical-form preservation and modernization suppression
 
-## 5. Data strategy
+- **Task.** Given a historical passage with OCR errors, output a corrected diplomatic transcription that fixes OCR errors but keeps valid period spellings, long s where the target convention keeps it, archaic morphology (*-eth*, *-ick*), and period capitalization.
+- **Failure.** The model fixes OCR errors and also modernizes valid forms (*shew* → *show*, *publick* → *public*).
+- **Prompt that should fix it.** An instruction to preserve attested historical forms and correct only clear OCR errors, optionally with a few demonstrations.
+- **Why it is predicted to be local.** The failure looks like an output prior over a closed set of token pairs, which can live in embedding or unembedding rows or in a few late MLP directions. Robot WSP repaired a similar lexical issue through 65 embedding rows.
+- **Metrics.** Modernization-error rate on valid archaic tokens; Historical Character Preservation Rate; Archaic Insertion Rate (false archaisms); CER and WER against the diplomatic gold; OCR-fix recall, so that a model that simply copies input cannot score well.
 
-### 5.1 Project corpora
+### B3 (primary contrast): Evidence-first answering under historical noise
 
-The project expects access to combinations of:
+- **Task.** Historical QA on raw-OCR passages (ChroniclingAmericaQA and held-out ECCO material). The output is an answer plus a quoted supporting span.
+- **Failure.** The model answers from modern background knowledge or paraphrases without grounding, especially when OCR noise is heavy.
+- **Prompt that should fix it.** An instruction to locate and quote the supporting text before answering, and to say when the passage does not support an answer.
+- **Why it is predicted to be distributed.** The behavior is multi-step, depends on the input, and involves attention over the passage rather than a fixed output prior.
+- **Metrics.** Answer EM and F1; evidence-span F1; unsupported-claim rate; consistency between clean and OCR views.
 
-- ECCO page images, OCR, metadata, and ECCO-TCP transcriptions where alignable;
-- historical newspapers with page images, OCR, article boundaries, and dates;
-- COHA or comparable clean, time-indexed text;
-- Gale or other licensed collections where permitted.
+### B2 (optional middle point): Period word sense
 
-Each item should be represented, when possible, as a multi-view document bundle:
+- **Task.** Given a passage with a date and a target word whose sense has shifted (for example *nice*, *awful*, *silly*, *gay*), choose or describe the period-appropriate sense.
+- **Prompt.** An instruction to interpret words as a reader of the stated year would.
+- **Data.** A small instance-level set built from COHA or ECCO contexts with sense annotations, guided by SemEval-2020 Task 1 target words. SemEval itself scores graded change over corpora, so it is not used directly.
+- **Status.** Included only if B1 and B3 are on schedule after Phase 2. It adds a third point on the locality curve.
 
-```json
-{
-  "document_id": "...",
-  "work_id": "...",
-  "edition_family": "...",
-  "image": "...",
-  "raw_ocr": "...",
-  "diplomatic_text": "...",
-  "normalized_text": "...",
-  "year": 1764,
-  "genre": "sermon",
-  "printer": "...",
-  "source_collection": "..."
-}
-```
+## 6. Method
 
-Licenses must be recorded per field and per collection. Restricted source pages should not be redistributed unless explicitly allowed; derived annotations, identifiers, hashes, evaluation code, or a controlled evaluation service may still be releasable.
+### 6.1 Stage A: headroom audit
 
-### 5.2 Public benchmark suite
-
-Public benchmarks are necessary for comparability. The following compact suite covers distinct abilities rather than treating OCR as the whole problem.
-
-| Capability | Candidate benchmark | Views | Primary metrics |
-|---|---|---|---|
-| Historical QA | ChroniclingAmericaQA | corrected text, raw OCR, page image | EM, token F1, evidence localization |
-| Entity recognition/linking | HIPE-2022 or HIPE-2026 | multilingual historical newspaper OCR | span F1, linking accuracy |
-| Diachronic semantics | SemEval-2020 Task 1 | time-sliced English/German/Latin/Swedish | accuracy, Spearman correlation |
-| Layout and reading order | PRImA ENP historical newspapers | page image and layout ground truth | mAP/IoU, reading-order score |
-| Multilingual historical recognition | CHURRO-DS | page/region images across centuries and scripts | normalized edit similarity, CER/WER, historical preservation |
-| OCR robustness | ECCO-TCP pairs, BLN600, or KB historical ground truth | OCR and human text | CER/WER, HCPR/AIR, downstream retention |
-| Retrieval/layout scale | American Stories / Chronicling America | image, article regions, OCR, metadata | Recall@k, MRR, nDCG |
-| Controlled visual robustness | PHD-style rendered GLUE/SQuAD/NER | clean and degraded renderings | task metric under controlled shifts |
-| OCR-to-reasoning transfer | AncientDoc | historical page images, translation, QA | CER plus task-specific exact/semantic scores |
-| Professional historical reasoning | ProHist-Bench | expert questions and rubric evidence | rubric-level accuracy and evidence quality |
-| Temporal cutoff/knowledge | History-Event or TRACE-style probes | event chains and dates | recall, surprisingness, chronology consistency |
-| General regression | selected modern NLU and DocVQA tasks | text and documents | original task metrics |
-
-ChroniclingAmericaQA is especially useful because its records include questions, answers, cleaned context, raw OCR, dates, and source URLs. The same semantic task can therefore be evaluated under clean-text, noisy-text, image, and combined-input conditions.
-
-HIPE provides multilingual historical entity recognition and linking with explicit dates and document types. SemEval-2020 Task 1 tests semantic change across time and helps prevent the benchmark from collapsing into document reading alone.
-
-### 5.3 Contamination-aware challenge set
-
-Public benchmarks may have appeared in pretraining or synthetic post-training data. Public results must therefore be supplemented by a blind challenge set drawn from project corpora.
-
-Requirements:
-
-- split by complete work and **edition family**, not random page;
-- keep authors, printers, titles, and reprints from leaking across splits where feasible;
-- include rare genres, low-quality scans, and long-tail entities;
-- prefer recently digitized, unpublished, or access-controlled pages for the final blind test;
-- construct synthetic but linguistically valid counterfactual sentences that cannot have been memorized;
-- freeze test data before editing begins;
-- permit the editor to see edit/dev data only, use validation to accept edits, and run test once at the end.
-
-The benchmark should explicitly distinguish:
-
-1. exact memorization or passage continuation;
-2. historical linguistic generalization;
-3. document visual understanding;
-4. external retrieval ability;
-5. diachronic semantic competence.
-
-## 6. Proposed method
-
-### 6.1 Stage A: capability audit before editing
-
-Evaluate unmodified models under matched views:
+For each target model, evaluate B1 and B3 on matched views:
 
 ```text
-clean transcription
-historical/diplomatic transcription
+normalized text
+diplomatic transcription
 raw OCR
-synthetically corrupted OCR
-page image
-page image + OCR
-page image + clean text
+synthetic OCR (controlled corruption of diplomatic text)
 ```
 
-Use paired examples so that the content is constant while spelling, noise, image quality, layout, or metadata changes. This identifies whether a failure belongs to the language path, visual path, or cross-modal interface.
-
-Candidate model set:
-
-- at least three open-weight families when compute permits;
-- at least one small model suitable for rapid WSP replication;
-- at least one stronger text model;
-- at least one open vision-language model with accessible vision projector and language backbone.
-
-Closed frontier models can be used as diagnostic baselines or editors, but the primary target models must be open-weight for reproducibility.
-
-### 6.2 Stage B: Training-Free GRPO experience discovery
-
-For each historical query `q`, sample a group of `G` outputs under the current experiential prior `E[t]`. Score each rollout with a task-specific reward vector rather than a single opaque judge score:
+under three prompt conditions:
 
 ```text
-R = task correctness
-  + evidence/quotation grounding
-  + diplomatic-form preservation
-  + temporal consistency
-  + cross-view agreement
-  - hallucination/modernization penalties
-  - excessive token and tool cost
+C0  no special instruction
+C1  short manual behavior instruction
+C2  manual instruction + few-shot demonstrations
 ```
 
-Use deterministic rewards whenever possible: exact or span match, entity/linking F1, CER/WER, HCPR/AIR, citation overlap, reading-order accuracy, and consistency between image/OCR/clean-text views. An LLM judge should be reserved for criteria such as evidentiary reasoning and must be calibrated against human ratings.
+Report prompt gain with paired bootstrap confidence intervals. A behavior proceeds only if `Gain_P` is significant and practically meaningful (thresholds in Section 9).
 
-An experience updater compares high- and low-reward rollouts within the group and produces a semantic advantage: a concise statement of what the successful trajectories did differently. Aggregate these advantages into `E[t+1]`, deduplicate them, and repeat for a small number of epochs on the edit split. Select the final `E*` on held-out validation, not training reward.
+### 6.2 Behavior sources
 
-Run both self-updater and teacher-updater variants when feasible. A directly generated experience of the same length, without grouped reward contrasts, is an essential control for whether the GRPO-inspired loop adds value beyond asking a strong model to write a good historical prompt once.
+| ID | Source | Notes |
+|---|---|---|
+| S1 | Short manual instruction | Primary source for all behaviors |
+| S2 | Manual instruction + few-shot demonstrations | Tests whether demonstrations compile differently from instructions |
+| S3 | Directly generated instruction of matched length | Control for prompt length and wording |
+| S4 | Training-Free GRPO experience prior `E*` | Secondary; self-updater and teacher-updater reported separately |
+| S5 | Shuffled or unrelated text of matched length | Negative control for compilation of "any long prompt" |
 
-The learned experience should contain reusable procedures, for example:
+The compilation target is always the behavior induced by a source on discovery data, and only outputs that also score well on the task metric are used as compilation targets. The prompted model is a teacher, not ground truth.
 
-- preserve attested historical forms unless normalization is explicitly requested;
-- compare uncertain glyphs against both image evidence and local lexical context;
-- respect column and article boundaries before answering;
-- separate facts visible in the document from modern background knowledge;
-- quote and localize evidence before drawing a historical conclusion.
+### 6.3 Compilation routes
 
-Do not place document-specific answers, rare facts, or test examples in the experience prior. Such content belongs in retrieval, not adaptation.
+All routes are evaluated without the prompt at inference.
 
-### 6.3 Stage C: constrained edit spaces
+| ID | Route | Gradients | Edit space | Role |
+|---|---|---:|---|---|
+| R1 | Closed-form prompt-to-weight (Transmuting Prompts style) | no | MLP up/gate (and down for bias) in selected layers; rank capped | Main gradient-free compiler |
+| R2 | Closed-form token-row edit | no | Selected input-embedding and/or unembedding rows for identified token pairs | Tests the lexical-prior hypothesis for B1 directly |
+| R3 | Agentic WSP | no | Declared mask; editor sees paired prompted/unprompted traces and locality reports | Tests whether a reasoning model finds better edits than closed form; may return no edit |
+| R4 | Activation steering from prompted-minus-unprompted means | no | Inference-time hidden-state addition (non-persistent) | Upper reference for what a fixed direction can do |
+| R5 | Gradient-based context distillation (LoRA; OEL-style on-policy reverse KL) | yes | LoRA on all linear layers at a standard rank | Required gradient-based reference |
+| R6 | Matched random edits | no | Same layers, rank, norm, and parameter count as R1–R3 | Control |
 
-Do not initially expose every parameter. Define reversible edit spaces:
-
-**Text models**
-
-- selected token-embedding rows or low-dimensional embedding transforms;
-- a small set of middle-layer MLP directions;
-- attention output projections implicated by causal tests;
-- an identity-initialized low-rank historical adapter that the editor writes directly.
-
-**Vision-language models**
-
-- visual patch embedding or normalization parameters;
-- the vision-to-language projector;
-- selected early language layers processing image tokens;
-- low-rank adapters attached to the visual projector or cross-modal layers.
-
-Editing an isolated adapter is safer and easier to distribute; editing original weights is a stronger scientific test. Both should be evaluated separately.
-
-### 6.4 Stage D: experience-to-weight compiler and editor harness
-
-The editor receives:
-
-- the target model architecture and tokenizer/processor;
-- summaries or slices of permitted parameters;
-- paired failure examples from the edit split;
-- the validated experience prior `E*`, its revision history, and grouped rollout/reward contrasts;
-- paired activations or logits with and without `E*` on the same inputs;
-- activation, attention, similarity, and error-cluster reports;
-- a CPU/Python workspace with bounded read/write access;
-- a limited forward-pass budget;
-- an API that can propose, apply, revert, and hash candidate edits.
-
-The editor must not receive test examples or unrestricted internet access during an edit trajectory.
-
-A candidate edit \(\theta'\) is accepted only if it improves a predeclared historical validation objective while satisfying regression and sparsity constraints. A conceptual objective is:
+Edit-size tiers, reported for every route:
 
 ```text
-historical_gain(theta')
-- lambda * general_capability_regression(theta')
-- mu * edit_size(theta', theta)
-- nu * newly_introduced_failures(theta')
+tiny:    <= 0.001% of parameters (or equivalent stored factors)
+small:   <= 0.01%
+medium:  <= 0.1%
 ```
 
-The editor is allowed to return **no edit**. Refusal is a correct outcome when the evidence does not support a localized intervention.
+Both stored size and the number of materialized dense values changed are reported, since a low-rank update is not sparse once materialized.
 
-Evaluate two compilation routes:
+R3 cost is reported in editor tokens and dollars next to R5's GPU time. If R3 does not beat R1 at matched size, the paper says so and treats R3 as a negative result rather than tuning it further.
 
-1. **Agentic WSP:** the editor inspects the experience-conditioned behavioral delta, activations, and allowed weights, then proposes a sparse or low-rank patch.
-2. **Closed-form prompt-to-weight distillation:** fit a bounded update that makes the unprompted model reproduce selected internal states or output behavior of the same model conditioned on `E*`.
+### 6.4 Locality diagnostics (measured before editing)
 
-The key ablation matrix is:
+On discovery data, for each behavior and model, compare runs with and without the prompt and compute:
 
-| Variant | Experience prompt | Weight change | Purpose |
-|---|---:|---:|---|
-| Base | no | no | unadapted model |
-| Manual prompt | manual | no | ordinary prompting baseline |
-| TF-GRPO | learned `E*` | no | benefit of semantic experience search |
-| WSP-only | no | yes | direct editing without a discovered policy |
-| TF-GRPO + WSP | used during compilation only | yes | main persistent hybrid |
-| TF-GRPO + closed-form distillation | used during compilation only | yes | controlled compiler baseline |
-| TF-GRPO + WSP + runtime `E*` | yes | yes | upper bound and interaction test |
+1. **Layer concentration.** Activation-patch the prompted residual stream into the unprompted run one layer (or one block of layers) at a time, and measure how much of the behavioral gain each recovers. Summarize as the share recovered by the best `k` layers and as an entropy over layers.
+2. **Effective rank of the prompt effect.** Singular-value spectrum of the stacked prompted-minus-unprompted activation deltas at each layer, summarized as the rank needed for 90% of the variance.
+3. **Component concentration.** The share of the gain recovered by patching the top-k MLP neurons, attention heads, or embedding/unembedding rows, found by attribution patching.
+4. **Token concentration (B1).** The share of the gain carried by a closed set of identified token pairs (archaic form versus modern form).
 
-The central comparison is not merely final accuracy. It asks how much of the prompt-only gain survives compilation and whether the edit removes enough recurring context/API cost to justify its regression risk.
+These are computed on discovery data only, frozen, and then correlated with retention measured on validation and test data. The correlation is the central test of RQ3.
 
-### 6.5 Stage E: retrieval boundary
+### 6.5 Retrieval boundary
 
-Weight editing should target reusable capabilities, not memorize the archive. Long-tail facts, page-specific claims, and bibliographic evidence should remain in an external retrieval layer. The intended system boundary is:
-
-```text
-edited historical model = better reader/reasoner
-retrieval system         = historical memory and evidence
-```
-
-This separation makes it possible to test whether editing improves document interpretation without conflating the result with knowledge injection.
+Compilation targets reusable reading behaviors, not facts. Long-tail entities, page-specific claims, and bibliographic evidence stay in retrieval. If a behavior's prompt gain turns out to come from knowledge carried in the prompt (for example, period spellings listed explicitly in demonstrations), it is reclassified as knowledge, and a retrieval baseline is added for it.
 
 ## 7. Evaluation protocol
 
-### 7.1 Baselines
+### 7.1 Required comparisons
 
-At minimum, compare against:
+For each behavior and model:
 
-- original frozen model;
-- manually designed prompting/in-context learning;
-- Training-Free GRPO with the learned experience prior retained at inference;
-- prompt-to-weight or closed-form instruction distillation where compatible;
-- the proposed Training-Free GRPO-to-WSP hybrid;
-- RAG where the task permits retrieval;
-- activation steering;
-- in-context editing or an external correction memory;
-- random edits matched by layer, rank, parameter count, and norm;
-- a conventional model editor such as ROME/MEMIT/AlphaEdit on compatible targets;
-- LoRA or another parameter-efficient trained adapter;
-- continued pretraining/domain-adaptive pretraining where compute permits;
-- historical pretrained models such as MacBERTh, PHD, CHURRO, or TypewriterLM on compatible tasks.
+- base model (M0);
+- base + each behavior source (S1–S5) at inference;
+- each compilation route (R1–R6) without the prompt;
+- compiled model + prompt, to test whether compilation and context are complementary.
 
-The comparison with trained baselines is necessary even though HisFree is training-free: the paper must quantify what quality is traded for the absence of backpropagation.
+Historical pretrained models (TypewriterLM, CHURRO) appear only as reference points on compatible B1/B3 subsets, not as competitors. The paper's claim concerns compilation, not the best historical model.
 
 ### 7.2 Metrics
 
-Report task metrics separately and summarize results along five axes:
-
-1. **Historical gain:** normalized improvement across historical tasks.
-2. **General retention:** change on modern/general benchmarks and unrelated historical tasks.
-3. **Adaptation efficiency:** examples, group size, rollout count, experience-update calls, target-model forward passes, editor calls, wall time, and energy/compute where available.
-4. **Transfer:** gain on unseen corpora, periods, genres, languages, and model families.
-5. **Deployment efficiency:** experience-prompt tokens per request, added latency, parameters changed, rank/norm, and the query volume at which compilation amortizes its one-time cost.
-
-Let `C_compile` be the one-time cost of compiling and validating an edit, `C_prompt` the per-query cost with the learned experience prompt, and `C_edit` the per-query cost of the edited model. When `C_prompt > C_edit`, report the deployment break-even point:
-
-```text
-N_break-even = C_compile / (C_prompt - C_edit)
-```
-
-This prevents "low cost" from meaning only that backpropagation was avoided while hiding a large rollout or long-context bill.
-
-For transcription-like tasks, include historical-fidelity measures in addition to CER/WER, such as preservation of valid archaic forms and rates of anachronistic or invented characters. A lower CER is not sufficient if the model modernizes the evidence.
+1. **Behavior score.** Task metrics from Section 5, reported per component.
+2. **Retention ratio.** Primary quantity, with bootstrap confidence intervals.
+3. **Preservation.** Change on a fixed general suite (e.g. MMLU subset, GSM8K subset, IFEval, and a modern spelling-correction set, which catches an edit that archaizes modern text). Report average change, worst single-task change, and repaired/broken counts.
+4. **Edit size.** Stored parameters, materialized changed values, affected layers, norm.
+5. **Compilation cost.** Forward passes, linear-solve time, editor tokens (R3), GPU time (R5).
+6. **Transfer.** Cross-work, cross-corpus, cross-period, and cross-view retention.
+7. **Robustness.** Retention after 8-bit and 4-bit quantization of the edited model.
 
 ### 7.3 Statistical requirements
 
-- run multiple independent editor trajectories;
-- freeze decoding and evaluation settings before comparison;
-- evaluate by unconstrained/free generation rather than teacher-forced target likelihood alone;
-- use paired tests or paired bootstrap confidence intervals;
-- report repairs and regressions, not only aggregate accuracy;
-- report direct reliability, paraphrase generalization, derived-instance portability, semantic ripple effects, and locality separately;
-- hash all base and edited parameter tensors;
-- retain complete edit logs;
-- retain every experience-prior version, grouped rollout, reward component, and semantic-advantage update;
-- include unsuccessful edits and no-edit outcomes.
+- Free generation only; never teacher-forced likelihood as the success measure.
+- Paired bootstrap confidence intervals; exact McNemar tests for paired binary outcomes; Holm correction across secondary comparisons.
+- At least three seeds or independent trajectories per route in the main runs.
+- Locality–retention correlation reported with Spearman's ρ and a bootstrap interval over items, plus a permutation test over behaviors and models. With few behaviors, the analysis is also reported per behavior at the item-cluster level so that it does not rest on three points.
+- All splits, prompts, diagnostics, and thresholds frozen before the test run; the test run happens once.
+- All tensors hashed; full edit logs and no-edit outcomes retained.
 
 ### 7.4 Success criteria
 
-An edit should count as successful historicalization only if it:
+The thesis is supported if all of the following hold:
 
-- improves at least two distinct historical capabilities;
-- transfers to a corpus not used during editing;
-- survives paraphrase or view changes;
-- causes no material general-capability regression beyond a predefined tolerance;
-- beats matched random edits;
-- is stable across more than one run or has a documented variance profile.
+1. B1 has a gradient-free route with retention ≥ 50% at the small or medium tier, passing preservation, and beating matched random edits.
+2. B3's best gradient-free retention is significantly lower than B1's, while R5 retains a comparable share for both.
+3. The pre-registered locality diagnostics rank the behaviors in the same order as gradient-free retention on both model families.
+4. The B1 edit transfers to at least one unseen corpus or period.
 
-For the hybrid method, additionally require that the compiled model retains a predeclared fraction of the TF-GRPO prompt-only gain and has a plausible measured break-even point relative to continuing to send `E*` on every query.
+Partial outcomes are still reportable:
 
-## 8. Initial experiment plan
+- If (1) holds but (2) does not, the paper reports broad gradient-free compilability of historical behaviors, which is a stronger positive result.
+- If (1) fails while R5 succeeds, the paper reports that even a lexical-looking behavior needs gradients, and the diagnostics explain why.
+- If prompt headroom is absent (Gate 1), the project pivots before investing in compilation.
 
-### Phase 0: repository and data contracts (week 1)
+## 8. Plan
 
-- create dataset manifests with provenance, license, modality, date range, and release constraints;
-- define the multi-view document schema;
-- select a small public benchmark subset for rapid iteration;
-- implement immutable edit/dev/validation/test splits by work and edition family;
-- establish experiment configuration, checkpoint hashing, and result logging.
+Timeline assumes one or two people and access to one or two 80GB GPUs. Target the next feasible ACL Rolling Review cycle; check the current ARR deadlines before fixing dates.
 
-**Deliverable:** reproducible data manifest and evaluation skeleton.
+### Phase 0: kill test (weeks 1–2)
 
-### Phase 1: baseline audit (weeks 2--3)
+Minimal, cheap experiments that decide whether the project is viable.
 
-- evaluate 2--3 text models on clean versus historical versus OCR views;
-- evaluate at least one VLM on image, OCR, and image-plus-OCR inputs;
-- run memorization probes and synthetic counterfactual tests;
-- cluster failures by orthography, temporal semantics, entity rarity, OCR pattern, layout, and evidence localization;
-- identify a small number of repeated, plausibly localized failures.
+1. Pick two main targets from different families in the 4B–9B range with open weights and a standard tokenizer.
+2. Build a 200-item B1 pilot from ECCO-TCP diplomatic text aligned with ECCO OCR or BLN600, split by work. Add 50 synthetic counterfactual items (unseen modern sentences converted with documented period spelling rules) to check contamination.
+3. Build a 150-item B3 pilot from ChroniclingAmericaQA raw-OCR records.
+4. Run C0/C1/C2 on both pilots for both models.
+5. Implement R1 on one or two layers for B1 and measure retention on 50 held-out items.
 
-**Deliverable:** capability audit report and a go/no-go decision for weight editing.
+**Pass:** B1 modernization-error rate under C0 is high enough to matter (initial threshold: ≥ 10% of valid archaic tokens modernized); C1 reduces it by ≥ 30% relative; R1 retains ≥ 20% of that gain at any tier. B3 shows a significant C1 gain in evidence F1.
 
-### Phase 2: reproduce Training-Free GRPO and a known WSP edit (week 3)
+**If B1 fails headroom:** try a smaller or older model, or switch the primary behavior to period word sense (B2). **If B3 fails headroom:** choose another procedural contrast (for example "flag uncertain readings").
 
-- reproduce the released Training-Free GRPO loop on a small reasoning or search subset;
-- verify that group-relative semantic experience outperforms an equal-length manually generated experience;
-- reproduce or closely replicate a released small-model WSP experiment;
-- verify the harness can read, patch, revert, hash, and evaluate weights;
-- reproduce matched random-edit controls;
-- document all deviations from the released setup.
+**Deliverable:** a one-page go/no-go memo with the numbers.
 
-**Deliverable:** validated experience-search and editor harnesses independent of historical data.
+### Phase 1: harness and reproduction (weeks 3–4)
 
-### Phase 3: text-only experience-to-weight pilot (weeks 4--6)
+- Reproduce one Transmuting Prompts result on Gemma 3 1B (e.g. a translation or detox task) to validate the R1 implementation.
+- Implement R2, R4, R5, and R6, and the locality diagnostics.
+- Implement the R3 editor harness: read, patch, revert, hash, and a bounded forward-pass API. Reproduce one released WSP edit if logs permit; otherwise document why not.
+- Freeze the data manifests and the discovery/validation/test splits by work and edition family.
 
-- choose one failure class with strong evidence of shared structure;
-- run Training-Free GRPO on a small edit set to learn `E*`;
-- test `E*` as a frozen prompt on held-out corpora and compare it with manual prompt optimization;
-- compare embedding-row, low-rank adapter, MLP-direction, and activation-steering interventions;
-- give a strong editor the validated experience and paired prompted/unprompted traces, then request bounded changes;
-- compare agentic WSP with a closed-form prompt-to-weight compiler;
-- validate on held-out corpora and modern regression tasks;
-- test whether improvements persist under clean, OCR, and paraphrased views.
+**Deliverable:** a validated harness and frozen splits.
 
-Promising first targets:
+### Phase 2: full B1 study (weeks 5–8)
 
-- orthographic fragmentation and archaic spelling invariance;
-- modernization bias in diplomatic transcription;
-- temporal word-sense calibration;
-- named-entity robustness under OCR corruption.
+- Full B1 data: about 100 discovery, 100 validation, 300 public test, and 300 held-out ECCO/newspaper test items.
+- All sources S1–S5 and all routes R1–R6 at three size tiers, on the first model family.
+- Locality diagnostics for B1.
+- Preservation suite and quantization check for the best edits.
+- Analysis of where the best gradient-free edit lives (rows, layers, directions).
 
-**Deliverable:** first causal claim about when a learned historical experience can or cannot be compiled into weights.
+**Deliverable:** the B1 result table and an edit-localization analysis.
 
-### Phase 4: multimodal pilot (weeks 7--9)
+### Phase 3: contrast behaviors and second family (weeks 9–11)
 
-- align page-image, OCR, and clean-text representations for the same content;
-- learn a multimodal experience prior that explicitly compares image evidence with OCR and clean text;
-- diagnose projector versus language-backbone errors;
-- edit a projector or isolated cross-modal adapter first;
-- evaluate on ChroniclingAmericaQA and a blind ECCO/newspaper subset;
-- include layout and evidence-localization tasks, not only transcription.
+- B3 with the same pipeline; B2 if on schedule.
+- Repeat B1 and B3 on the second model family.
+- Locality–retention correlation analysis.
+- Training-Free GRPO as source S4 on B1 and B3 (secondary; drop if it produces no prompt gain).
 
-**Deliverable:** multimodal historicalization result with image/text ablations.
+**Deliverable:** the compilability-versus-locality figure, the paper's central result.
 
-### Phase 5: scale and paper decision (weeks 10--12)
+### Phase 4: transfer, robustness, and writing (weeks 12–14)
 
-- repeat the best method across model families;
-- measure the prompt-versus-edit deployment break-even point under realistic archive query volumes;
-- add multilingual or cross-domain transfer if targeting a general ML venue;
-- complete baselines and statistical analysis;
-- decide between two paper framings:
-  - **NLP framing:** latent historical capability and contamination-aware low-cost adaptation;
-  - **ML framing:** compiling group-relative semantic experience into persistent weight updates.
+- Cross-corpus and cross-period transfer for the best B1 edit.
+- Final held-out test run, once.
+- Writing, with a limitations section on scale, language (English only), and number of behaviors.
 
-**Deliverable:** paper-ready result table, limitations, and release plan.
+**Deliverable:** a submission-ready paper.
 
 ## 9. Go/no-go gates
 
-### Gate 1: latent capability exists
-
-Proceed to editing only if the unmodified model is substantially better on clean historical text than on one or more corrupted/modal variants, or if a repeated historical failure can be localized. If performance is uniformly poor, the model likely lacks the capability and conventional training or retrieval is the more honest solution.
-
-### Gate 2: the learned experience transfers
-
-Proceed to weight compilation only if `E*` beats a manual or directly generated equal-length prompt on an unseen corpus or task. If it only improves its own edit examples, Training-Free GRPO has overfit the feedback loop.
-
-### Gate 3: compilation preserves the experience gain
-
-Retain a compiled edit only if it preserves a predeclared share of the prompt-only gain, passes locality/general-regression checks, and offers a credible deployment-cost advantage. Otherwise deploy `E*` contextually and leave the base weights unchanged.
-
-### Gate 4: edits transfer
-
-Proceed beyond a pilot only if an edit improves a corpus or task not used to propose it. Improvements limited to the edit set are not evidence of historicalization.
-
-### Gate 5: editing is competitive
-
-Continue the training-free claim only if editing offers a meaningful advantage in compute, data, interpretability, modularity, or preservation relative to LoRA/continued pretraining. If it is simply worse and not cheaper or more interpretable, report the negative result rather than forcing the framing.
-
-### Gate 6: multimodality adds evidence
-
-Include the VLM contribution only if image inputs reveal or solve a failure not captured by text/OCR alone. Otherwise, keep the first paper text-focused and treat multimodality as follow-up work.
+| Gate | Condition to proceed | If it fails |
+|---|---|---|
+| G1 Headroom | Significant, meaningful prompt gain on B1 (and B3) on held-out data | Change model or behavior; do not proceed to compilation |
+| G2 Harness | R1 reproduces a published Transmuting Prompts effect; R5 reaches high retention on B1 | Fix the implementation before interpreting any null result |
+| G3 B1 compilability | Some gradient-free route beats matched random edits on B1 validation | Report the negative result; shift emphasis to the gradient-free/gradient gap and the diagnostics |
+| G4 Contrast | B3 runs complete on both families | Report B1 alone as a narrower localization paper (weaker; likely Findings) |
+| G5 Predictors | Diagnostics frozen before retention is measured on validation and test | No post hoc diagnostics in the main claim |
 
 ## 10. Risks and mitigations
 
 | Risk | Consequence | Mitigation |
 |---|---|---|
-| Public benchmark contamination | Apparent capability may be memorization | blind/private test, post-cutoff scans, counterfactual examples, edition-family splits |
-| Semantic experience overfits rewards | Prompt improves the proxy but not historical usefulness | decomposed rewards, human calibration, blind corpus transfer, equal-length prompt controls |
-| Long experience prompt is costly | "Training-free" shifts cost to every inference call | report tokens/latency and break-even point; compile only stable reusable experience |
-| Experience-to-weight compilation fails | Prompt behavior is conditional or distributed | keep `E*` as contextual memory; report compilation retention and no-edit result |
-| Editor overfits validation feedback | "Training-free" becomes test optimization | strict split isolation, bounded calls, one-shot final test, complete logs |
-| No localized historical failure | Weight editing cannot add missing ability | allow no-edit outcome; use retrieval or trained baseline |
-| Catastrophic or silent regressions | Historical gain damages general model | regression gate, matched controls, reversible adapter, per-edit hashes |
-| Proprietary editor dependence | Poor reproducibility | test multiple editors, include open editor if possible, release prompts/logs |
-| Restricted ECCO/Gale licenses | Cannot release data or checkpoint | provenance manifest, derived annotations, IDs/hashes, public benchmarks, evaluation service |
-| Historical modernization | Better surface metrics but damaged evidence | diplomatic/normalized outputs, historical preservation and anachronism metrics |
-| Benchmark too OCR-centric | Weak foundation-model claim | require QA, IE, semantic change, retrieval, and document tasks |
-| Compute cost of repeated VLM evaluation | Project stalls before method test | begin with small text model and fixed benchmark subsets |
+| Modern models already preserve historical forms | No headroom for B1 | Phase 0 measures this in two weeks; fall back to B2 or older/smaller models |
+| Public benchmark contamination | Prompt gain or retention reflects memorization | Counterfactual archaic sentences; work and edition-family splits; held-out ECCO/newspaper test |
+| Gradient-free compilation fails on every behavior | No positive headline | Paper becomes "what gradients buy," supported by R5 and the diagnostics; still a contribution if the diagnostics explain the gap |
+| Locality diagnostics do not predict retention | Central thesis fails | Report it; the B1 localization analysis and the gradient-free/gradient gap remain |
+| Only two or three behaviors | Correlation claim is thin | Item-cluster analysis within behaviors (e.g. by token-pair frequency or OCR noise level); two families; B2 as a third point |
+| Edit archaizes modern text | Damages general use | Modern spelling-correction set in the preservation suite; count false archaisms |
+| WSP editor cost and opacity | Reproducibility concerns | R3 is not the main route; release prompts and logs; report cost next to R5 |
+| Crowding by WSP follow-ups | Novelty erodes | The claim does not depend on being first to apply WSP; prioritize Phase 0–2 speed |
+| ECCO/Gale licensing | Cannot release data or checkpoints | Use ECCO-TCP and BLN600 where possible; release IDs, hashes, derived annotations, and edit factors |
+| Teacher-updater injects knowledge into `E*` | Confounds S4 | Report updater identity; compare with self-updater; S4 is secondary |
+| Quantization erases small edits | Edits look fragile | Report post-quantization retention; treat failure as a finding about edit size |
 
 ## 11. Expected contributions
 
-A strong paper should aim to contribute all of the following:
+1. **A compilability analysis of historical reading behaviors.** Retention under gradient-free and gradient-based compilation for behaviors that span the locality spectrum, on two model families.
+2. **Pre-edit locality diagnostics that predict gradient-free compilability.** A practical rule for deciding whether a prompted behavior can be moved into weights without gradients or should stay in context.
+3. **A localized account of modernization bias.** Where in the model the prompt's effect on historical-form preservation lives, and a tiny edit that removes the bias without a system prompt.
+4. **A controlled multi-view historical testbed.** Paired normalized, diplomatic, raw-OCR, and synthetic-OCR items with deterministic metrics, released where licenses allow.
+5. **Full logs and negative results.** All edits, no-edit outcomes, random-edit controls, and costs.
 
-1. A contamination-aware audit of historical capability in modern open language and vision-language models.
-2. A Training-Free GRPO procedure for learning an interpretable historical reading prior from group-relative semantic feedback.
-3. A reproducible compiler from validated experience to bounded gradient-free weight edits.
-4. Evidence identifying which historical failures belong in prompts, weights, retrieval, or conventional training.
-5. A multi-view evaluation protocol spanning clean text, OCR, page images, and metadata.
-6. A public benchmark configuration plus a blind challenge set protocol.
-7. Full experience/edit trajectories, negative results, matched controls, cost accounting, and regression analysis.
+## 12. Out of scope for this paper
 
-The strongest scientific result may be positive or negative. A rigorous demonstration that broad historical ability cannot be reliably created through WSP, despite successful narrow repairs, would still clarify the boundary between capability elicitation and domain learning.
+- Multimodal page images and vision-projector editing (follow-up paper; HisDoc-OCR suggests the language-prior finding may transfer).
+- Building a general historical foundation model or matching TypewriterLM.
+- Injecting archive facts into weights.
+- Retrieval quality and integration with a semantic-search system.
+- Multilingual evaluation, except as a stretch goal if B1 transfers easily.
 
-## 12. Venue strategy
+## 13. Venue strategy
 
-The method should determine the venue, not the other way around.
+- **EMNLP / ACL main (primary target).** A compilability analysis with a historical testbed and a clear negative/positive boundary fits the "analysis and interpretability" and "computational social science and cultural analytics" tracks.
+- **ICLR / NeurIPS.** Only if the locality–compilability result holds beyond historical text. That would require adding non-historical behaviors and is not planned for the first paper.
+- **Findings.** A realistic fallback if only B1 succeeds without the contrast and predictor results.
 
-- **ACL / EMNLP:** best fit for the historical capability audit, benchmark, and NLP-focused weight-editing study.
-- **ICML / ICLR / NeurIPS:** plausible only if the method generalizes beyond historical text and establishes a general principle of gradient-free domain specialization.
-- **CVPR:** plausible if the principal contribution is multimodal page representation or visual-projector editing.
-- **ICDAR:** excellent topical fit for historical document understanding, though it is not CCF B or above in the current CCF list.
+For CCF classification, verify the current official list. Main-conference long papers count; Findings, short papers, demos, and workshops do not.
 
-For CCF classification, verify the current official list and submission category. The current CCF policy counts main-conference full/regular papers, not Findings, short papers, demos, or workshops.
-
-## 13. Suggested repository structure
+## 14. Repository structure
 
 ```text
 emnlp-hisfree/
 ├── README.md
 ├── BACKGROUND_AND_PLAN.md
-├── configs/
-│   ├── data/
-│   ├── models/
-│   ├── edits/
-│   └── evaluations/
-├── data/
-│   ├── manifests/
-│   └── README.md
+├── EXPERIMENT_DESIGN.md
+├── configs/        # models, behaviors, routes, budgets
+├── data/manifests/ # provenance, license, split hashes
 ├── src/
-│   ├── datasets/
-│   ├── evaluation/
-│   ├── probes/
-│   ├── editing/
-│   └── logging/
-├── tests/
+│   ├── data/
+│   ├── behaviors/  # B1, B2, B3 task definitions and metrics
+│   ├── sources/    # manual prompts, few-shot, TF-GRPO
+│   ├── compile/    # R1–R6
+│   ├── locality/   # diagnostics
+│   └── eval/
 ├── scripts/
 ├── results/
-│   └── README.md
 └── docs/
-    ├── licenses.md
-    ├── benchmark_protocol.md
-    └── experiment_log.md
 ```
 
-## 14. Selected references and resources
+## 15. Selected references
 
 ### Historical language and document models
 
-- Manjavacas Arevalo, E. and Fonteyn, L. (2021). [MacBERTh: Development and Evaluation of a Historically Pre-trained Language Model for English (1450--1950)](https://aclanthology.org/2021.nlp4dh-1.4/).
-- Borenstein, N., Rust, P., Elliott, D., and Augenstein, I. (2023). [PHD: Pixel-Based Language Modeling of Historical Documents](https://aclanthology.org/2023.emnlp-main.7/).
-- Semnani, S. et al. (2025). [CHURRO: Making History Readable with an Open-Weight Large Vision-Language Model for High-Accuracy, Low-Cost Historical Text Recognition](https://aclanthology.org/2025.emnlp-main.1763/).
-- Harju, A. and van der Goot, R. (2025). [How to age BERT Well: Continuous Training for Historical Language Adaptation](https://aclanthology.org/2025.loreslm-1.21/).
+- Manjavacas Arevalo, E. and Fonteyn, L. (2021). [MacBERTh](https://aclanthology.org/2021.nlp4dh-1.4/).
+- Borenstein, N. et al. (2023). [PHD: Pixel-Based Language Modeling of Historical Documents](https://aclanthology.org/2023.emnlp-main.7/).
+- Semnani, S. et al. (2025). [CHURRO](https://aclanthology.org/2025.emnlp-main.1763/).
+- Harju, A. and van der Goot, R. (2025). [How to age BERT Well](https://aclanthology.org/2025.loreslm-1.21/).
 - Fittschen, E. et al. (2026). [Pretraining Language Models for Diachronic Linguistic Change Discovery](https://aclanthology.org/2026.findings-eacl.241/).
 - Luo, X. et al. (2026). [A Language Model from 1913: Pretraining on Historical Text](https://aclanthology.org/2026.emnlp-main.2474/).
-- Levchenko, M. A. (2025). [Evaluating LLMs for Historical Document OCR: A Methodological Framework for Digital Humanities](https://aclanthology.org/2025.lm4dh-1.7/).
+- Levchenko, M. A. (2025). [Evaluating LLMs for Historical Document OCR](https://aclanthology.org/2025.lm4dh-1.7/).
 - Kanerva, J. et al. (2025). [OCR Error Post-Correction with LLMs in Historical Documents: No Free Lunches](https://aclanthology.org/2025.resourceful-1.8/).
 - Thomas, M. et al. (2026). [Image-Informed Post-OCR Correction with Vision-Language Models](https://aclanthology.org/2026.findings-emnlp.60/).
-- Cao, J. et al. (2026). [HisDoc-OCR: Restoring Visual Grounding in MLLMs for Chinese Historical Document OCR](https://aclanthology.org/2026.findings-acl.301/).
+- Cao, J. et al. (2026). [HisDoc-OCR](https://aclanthology.org/2026.findings-acl.301/).
 
-### Weight and activation editing
+### Prompt and experience to weights
 
-- Meng, K. et al. (2022). [Locating and Editing Factual Associations in GPT (ROME)](https://arxiv.org/abs/2202.05262).
-- Mitchell, E. et al. (2022). [Fast Model Editing at Scale (MEND)](https://openreview.net/forum?id=0DcZxeWfOPt).
-- Mitchell, E. et al. (2022). [Memory-Based Model Editing at Scale (SERAC)](https://proceedings.mlr.press/v162/mitchell22a.html).
-- Meng, K. et al. (2023). [Mass-Editing Memory in a Transformer (MEMIT)](https://arxiv.org/abs/2210.07229).
-- Ilharco, G. et al. (2023). [Editing Models with Task Arithmetic](https://arxiv.org/abs/2212.04089).
-- Turner, A. M. et al. (2023). [Steering Language Models With Activation Engineering](https://arxiv.org/abs/2308.10248).
-- Cohen, R. et al. (2024). [Evaluating the Ripple Effects of Knowledge Editing in Language Models](https://aclanthology.org/2024.tacl-1.16/).
+- Snell, C., Klein, D., and Zhong, R. (2022). [Learning by Distilling Context](https://arxiv.org/abs/2209.15189).
+- Bhargava, A. et al. (2024). [Prompt Baking](https://arxiv.org/abs/2409.13697).
+- Ye, T., Dong, L., Dong, Q., et al. (2026). [Online Experiential Learning for Language Models](https://arxiv.org/abs/2603.16856).
+- Xie, C., Zhou, Y., Yang, W., et al. (2026). [EDGE: Experience-Distillation for Guided Exploration in Agentic Reinforcement Learning](https://aclanthology.org/2026.emnlp-main.624/).
+- Mazzawi, H., Dherin, B., Munn, M., et al. (2025/2026). [Transmuting Prompts into Weights](https://arxiv.org/abs/2510.08734).
+- Abbas, A.-A. and Seraj, E. (2026). [Distilling Instructions into Weights: Closed-Form Edits Fix a Robot Policy's Misreading](https://arxiv.org/abs/2611.11894).
+
+### Model editing, steering, and weight-space programming
+
+- Meng, K. et al. (2022). [ROME](https://arxiv.org/abs/2202.05262).
+- Mitchell, E. et al. (2022). [MEND](https://openreview.net/forum?id=0DcZxeWfOPt) and [SERAC](https://proceedings.mlr.press/v162/mitchell22a.html).
+- Meng, K. et al. (2023). [MEMIT](https://arxiv.org/abs/2210.07229).
+- Ilharco, G. et al. (2023). [Task Arithmetic](https://arxiv.org/abs/2212.04089).
+- Turner, A. M. et al. (2023). [Activation Engineering](https://arxiv.org/abs/2308.10248).
+- Cohen, R. et al. (2024). [RippleEdits](https://aclanthology.org/2024.tacl-1.16/).
 - Gupta, A. et al. (2024). [Model Editing at Scale Leads to Gradual and Catastrophic Forgetting](https://aclanthology.org/2024.findings-acl.902/).
-- Fang, J. et al. (2024). [AlphaEdit: Null-Space Constrained Knowledge Editing for Language Models](https://arxiv.org/abs/2410.02355).
-- Wang, P. et al. (2024). [WISE: Rethinking the Knowledge Memory for Lifelong Model Editing of Large Language Models](https://proceedings.neurips.cc/paper_files/paper/2024/hash/60960ad78868fce5c165295fbd895060-Abstract-Conference.html).
-- Yang, W. et al. (2025). [The Mirage of Model Editing: Revisiting Evaluation in the Wild](https://aclanthology.org/2025.acl-long.745/).
+- Fang, J. et al. (2024). [AlphaEdit](https://arxiv.org/abs/2410.02355).
+- Wang, P. et al. (2024). [WISE](https://proceedings.neurips.cc/paper_files/paper/2024/hash/60960ad78868fce5c165295fbd895060-Abstract-Conference.html).
+- Yang, W. et al. (2025). [The Mirage of Model Editing](https://aclanthology.org/2025.acl-long.745/).
+- Zhang, J. et al. (2026). [RULE-EDIT](https://aclanthology.org/2026.findings-emnlp.1924/).
 - Takehi, R., Teoh, J., Zhang, A., and Khattab, O. (2026). [Sparks of Weight-Space Programming](https://rikiyat.github.io/blog/weight-space-programming/).
-- Hu, J. et al. (2026). [Exploring Weight-Space Programming: Capabilities, Generalization, and Limitations](https://arxiv.org/abs/2611.09382).
-- Li, M. et al. (2026). [WeightLoop: Weight-Space Programming with Experimental Feedback](https://arxiv.org/abs/2611.07319).
+- Hu, J. et al. (2026). [Exploring Weight-Space Programming](https://arxiv.org/abs/2611.09382).
+- Li, M. et al. (2026). [WeightLoop](https://arxiv.org/abs/2611.07319).
 - Zhang, J., Wang, K., and Lin, L. (2026). [Can LLMs Debug Robots by Editing Their Weights?](https://arxiv.org/abs/2611.09376).
 - Ahmed, N. S. (2026). [Can an LLM Actually Reason and Program about Neural Network's Weights?](https://arxiv.org/abs/2611.08070).
-- Lindholz, M. et al. (2026). [Weight-Space Programming for Medical Imaging: Do We Still Need Training Data?](https://arxiv.org/abs/2611.12066).
-- Zhang, J. et al. (2026). [RULE-EDIT: Benchmarking Rule-Level Knowledge Editing in Large Language Models](https://aclanthology.org/2026.findings-emnlp.1924/).
-- Abbas, A.-A. and Seraj, E. (2026). [Distilling Instructions into Weights: Closed-Form Edits Fix a Robot Policy's Misreading](https://arxiv.org/abs/2611.11894).
+- Lindholz, M. et al. (2026). [Weight-Space Programming for Medical Imaging](https://arxiv.org/abs/2611.12066).
 
 ### Training-free policy and prompt optimization
 
 - Pryzant, R. et al. (2023). [Automatic Prompt Optimization with "Gradient Descent" and Beam Search](https://aclanthology.org/2023.emnlp-main.494/).
 - Zheng, C. et al. (2023). [Can We Edit Factual Knowledge by In-Context Learning?](https://arxiv.org/abs/2305.12740).
-- Cai, Y. et al. (2025). [Training-Free Group Relative Policy Optimization](https://arxiv.org/abs/2510.08191/) and [official implementation](https://github.com/TencentCloudADP/youtu-agent/tree/training_free_GRPO).
-- Mazzawi, H. et al. (2025/2026). [Transmuting Prompts into Weights](https://arxiv.org/abs/2510.08734).
-- Singh, A. et al. (2026). [TTRV: Test-Time Reinforcement Learning for Vision Language Models](https://openaccess.thecvf.com/content/CVPR2026/html/Singh_TTRV_Test-Time_Reinforcement_Learning_for_Vision_Language_Models_CVPR_2026_paper.html).
+- Cai, Y. et al. (2025). [Training-Free Group Relative Policy Optimization](https://arxiv.org/abs/2510.08191) and [implementation](https://github.com/TencentCloudADP/youtu-agent/tree/training_free_GRPO).
 
-### Public benchmarks and corpora
+### Benchmarks and corpora
 
-- Piryani, B., Mozafari, J., and Jatowt, A. (2024). [ChroniclingAmericaQA repository](https://github.com/datascienceUIBK/ChroniclingAmericaQA) and [paper](https://arxiv.org/abs/2403.17859).
-- HIPE team. [HIPE-2022 multilingual historical NER and entity-linking data](https://github.com/hipe-eval/HIPE-2022-data).
-- Schlechtweg, D. et al. (2020). [SemEval-2020 Task 1: Unsupervised Lexical Semantic Change Detection](https://aclanthology.org/2020.semeval-1.1/).
-- Dell, M. et al. (2023). [American Stories: A Large-Scale Structured Text Dataset of Historical U.S. Newspapers](https://proceedings.neurips.cc/paper_files/paper/2023/hash/ffeb860479ccae44d84c0de32acd693d-Abstract-Datasets_and_Benchmarks.html).
-- PRImA Research Lab. [ENP Image and Ground Truth Dataset of Historical Newspapers](https://www.primaresearch.org/datasets/ENP).
-- KB National Library of the Netherlands. [Delpher Newspapers](https://www.kb.nl/en/research-find/datasets/delpher-newspapers) and [historical newspaper OCR ground truth](https://lab.kb.nl/dataset/historical-newspapers-ocr-ground-truth).
-- Text Creation Partnership. [ECCO-TCP access and reuse FAQ](https://www.textpartnership.net/pages/faq.html).
-- Yu, H. et al. (2026). [AncientDoc: Benchmarking Vision-Language Models on Chinese Ancient Documents](https://aclanthology.org/2026.findings-acl.1438/).
-- Gao, L. et al. (2026). [ProHist-Bench: Can LLMs Act as Historians?](https://aclanthology.org/2026.acl-long.1378/).
-- Piper, A. and Jiang, J. (2026). [Evaluating Multi-modal LLMs on Historical Book Illustrations](https://aclanthology.org/2026.findings-emnlp.1304/).
+- Piryani, B., Mozafari, J., and Jatowt, A. (2024). [ChroniclingAmericaQA](https://github.com/datascienceUIBK/ChroniclingAmericaQA) ([paper](https://arxiv.org/abs/2403.17859)).
+- HIPE team. [HIPE-2022 data](https://github.com/hipe-eval/HIPE-2022-data).
+- Schlechtweg, D. et al. (2020). [SemEval-2020 Task 1](https://aclanthology.org/2020.semeval-1.1/).
+- Dell, M. et al. (2023). [American Stories](https://proceedings.neurips.cc/paper_files/paper/2023/hash/ffeb860479ccae44d84c0de32acd693d-Abstract-Datasets_and_Benchmarks.html).
+- Text Creation Partnership. [ECCO-TCP FAQ](https://www.textpartnership.net/pages/faq.html).
+- KB National Library of the Netherlands. [Historical newspaper OCR ground truth](https://lab.kb.nl/dataset/historical-newspapers-ocr-ground-truth).
+- Yu, H. et al. (2026). [AncientDoc](https://aclanthology.org/2026.findings-acl.1438/).
+- Gao, L. et al. (2026). [ProHist-Bench](https://aclanthology.org/2026.acl-long.1378/).
 
-## 15. Immediate next decisions
+## 16. Immediate decisions
 
-Before implementation, decide:
-
-1. Which open text model is small enough for the first reproducible WSP pilot?
-2. Which open VLM exposes a sufficiently simple vision projector for controlled editing?
-3. Which historical failure has reliable decomposable rewards for the first Training-Free GRPO pilot?
-4. Which project corpora can be legally used for experience discovery, editing, blind evaluation, and public release?
-5. What rollout/API and forward-pass budget is available, and what deployment volume defines a useful break-even point?
-6. Is the first paper primarily an audit paper or an experience-to-weight method paper?
-
-The recommended default is to begin with the audit, then run Training-Free GRPO before any historical weight edit. The prompt-only result is useful regardless of whether compilation succeeds, supplies a known-good behavior for the editor, and prevents the project from mistaking missing knowledge for an editable representational bottleneck.
+1. Which two 4B–9B open model families are the main targets?
+2. Is the B1 pilot built from ECCO-TCP aligned with ECCO OCR, from BLN600, or from both? Which is legally usable for release?
+3. Which ARR cycle is the target, and does the 14-week plan fit it?
+4. Is R3 (agentic WSP) worth the editor cost, or should it be limited to a small number of trajectories on B1 only?
+5. After Phase 0, revise the *pilot* thresholds in [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) once and freeze them.
