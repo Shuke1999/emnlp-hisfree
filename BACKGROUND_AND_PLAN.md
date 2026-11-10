@@ -2,9 +2,9 @@
 
 **Compiling historical reading behaviors from context into weights without gradients, and predicting when it works**
 
-**Version:** 0.2 (revised 10 November 2026 after a novelty and feasibility review)
+**Version:** 0.3 (revised 10 November 2026 after a novelty and feasibility review; 11 November 2026 adds causal-necessity, factorial-steering, and edit–prompt alignment analyses, and an optional SAE module)
 
-**Companion document:** [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) v0.2 gives the executable design (data construction, route specifications, diagnostics, metrics, thresholds, and the Phase 0 checklist).
+**Companion document:** [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) v0.3 gives the executable design (data construction, route specifications, diagnostics, metrics, thresholds, and the Phase 0 checklist).
 
 ## 0. What changed from v0.1 and why
 
@@ -44,7 +44,7 @@ Historical text is used as a **controlled testbed**, not as the whole contributi
 
 ## 2. Terminology
 
-**Gradient-free compilation.** A persistent parameter change computed without backpropagation through the target model and without an optimizer. Allowed computations are forward passes, closed-form solutions (least squares, ridge regression, projections), and edits proposed by an external reasoning model and checked with forward passes. This is not data-free or compute-free.
+**Gradient-free compilation.** A persistent parameter change computed without backpropagation through the target model and without an optimizer. Allowed computations are forward passes, closed-form solutions (least squares, ridge regression, projections), and edits proposed by an external reasoning model and checked with forward passes. This is not data-free or compute-free. All required diagnostics are forward-only as well; the only gradients anywhere in the project are in the gradient-based reference (R5) and in an optional attribution-assisted SAE analysis. In the paper, the precise term is **backprop-free, optimization-free weight compilation**.
 
 **Behavior source.** The prompt or context that induces the target behavior: a manual instruction, few-shot demonstrations, a directly generated instruction, or a Training-Free GRPO experience prior `E*`.
 
@@ -82,6 +82,7 @@ None of these works asks whether a prompted historical behavior can be moved int
 - **Locate-and-edit.** ROME and MEMIT make closed-form rank-one or multi-rank MLP edits for factual associations. AlphaEdit projects edits into a null space to protect other knowledge.
 - **Learned editors and memories.** MEND trains a hypernetwork. SERAC and WISE keep corrections in a separate memory.
 - **Activation steering.** Activation addition and related methods change hidden states at inference without persistent weight changes. Steering is the natural non-persistent reference for a compiled edit.
+- **Sparse-autoencoder feature analysis.** OpenAI's emergent-misalignment work and its follow-ups find behavior-driving SAE latents by model diffing and by paired attribution over completions with and without a behavior, then confirm them by steering in both directions; they also separate latents that drive a behavior from latents that protect against it. Their metagaming study combines several discovery methods (activation-frequency difference, gradient-direction similarity, attribution, checkpoint diffing) and checks whether they agree. HisFree borrows the validation logic (sufficiency, necessity, two-sided steering, driver versus suppressor) but keeps its required diagnostics forward-only. Public SAEs exist for every layer of Gemma 3 (Gemma Scope 2, including chat-tuned models) and of Llama-3.1-8B Base (Llama Scope).
 - **Evaluation pitfalls.** RippleEdits shows that edits fail to propagate and that an in-context baseline is often best. *The Mirage of Model Editing* shows that teacher-forced evaluation inflates single-edit success from 38.5% to 96.8%. RULE-EDIT shows near-perfect direct reliability alongside under 52% portability. Large-scale sequential editing causes forgetting.
 
 Factual editors target single associations, whereas HisFree targets **behaviors**. That distinction matters for the locality hypothesis: a modernization prior may look more like a set of token-level associations, and evidence-first answering does not.
@@ -188,6 +189,10 @@ This is the kill test. Without prompt headroom there is nothing to compile.
 
 Pre-registered predicted order: B1 (modernization suppression) > B2 (period word sense, optional) > B3 (evidence-first answering).
 
+H3 is tested on a **prediction track** whose compilation configuration never reads the diagnostics, so that a diagnostic is never used both to choose an edit and to predict its success. A separate **routing track** lets diagnostics choose layers, and tests whether that improves compilation.
+
+A further exploratory question is *how* the B1 prompt acts: does it activate a historical-preservation direction, suppress a default modernizing tendency, or gate between the two depending on context? Section 6.6 specifies the experiments; their outcome is reported as a candidate mechanism, not as a claim.
+
 ### RQ4: Does the behavior source matter?
 
 **H4.** For prompts with matched prompt gain, a short manual instruction compiles with higher retention than a longer Training-Free GRPO experience prior, because the experience prior encodes more conditional, procedural content. This is secondary and may be dropped if Training-Free GRPO does not produce a prompt gain on the target model.
@@ -289,10 +294,19 @@ On discovery data, for each behavior and model, compare runs with and without th
 
 1. **Layer concentration.** Activation-patch the prompted residual stream into the unprompted run one layer (or one block of layers) at a time, and measure how much of the behavioral gain each recovers. Summarize as the share recovered by the best `k` layers and as an entropy over layers.
 2. **Effective rank of the prompt effect.** Singular-value spectrum of the stacked prompted-minus-unprompted activation deltas at each layer, summarized as the rank needed for 90% of the variance.
-3. **Component concentration.** The share of the gain recovered by patching the top-k MLP neurons, attention heads, or embedding/unembedding rows, found by attribution patching.
+3. **Component sufficiency and necessity.** Rank MLP neurons and attention heads separately by activation delta times output-weight norm (no gradients). Sufficiency: the share of the gain recovered by patching the top-k prompted components into the unprompted run. Necessity: the share lost by ablating the same components in the prompted run. Sizes are normalized by the number of components of each type, so families with different widths are comparable.
 4. **Token concentration (B1).** The share of the gain carried by a closed set of identified token pairs (archaic form versus modern form).
+5. **Direction consistency.** How similar the prompt's push is across items.
 
-These are computed on discovery data only, frozen, and then correlated with retention measured on validation and test data. The correlation is the central test of RQ3.
+These are computed on discovery data only, frozen, and then correlated with retention measured on validation and test data. The correlation is the central test of RQ3. One primary predictor (layer concentration or normalized component sufficiency) is chosen in Phase 0 by a fixed rule based only on measurement reliability. The rest are secondary. No composite score of several diagnostics is used.
+
+### 6.6 Mechanism analyses
+
+These explain results and are not success criteria.
+
+- **Factorial steering (B1).** Crossing prompt (none, S1), steering along the prompt direction (none, positive, negative), input (historical, modern), and instruction (default, "modernize the spelling") separates a single causal direction, a context-gated mechanism, a global spelling bias, and a mainly suppressive mechanism. Whether a suppressive mechanism favors token-row edits (R2) and a driving one favors MLP edits (R1) is tested, not assumed.
+- **Edit–prompt alignment.** For each accepted edit, compare the edit-induced activation change with the prompt-induced change, layer by layer. High alignment with good generalization indicates that the edit replicates the prompt's mechanism; low alignment with good generalization indicates functional substitution; low alignment with gains only on seen token pairs indicates a shallow shortcut. Alignment is not required for success.
+- **Optional SAE module.** Only on Gemma 3 4B-IT, only for B1 and B3, at 2–3 layers fixed in advance, using Gemma Scope 2 SAEs. It repeats sufficiency, necessity, and factorial steering in the SAE basis, and adds paired latent attribution as a gradient-using reference, to test whether the forward-only diagnostics predict compilability as well as an attribution-assisted one. It is not part of any core claim.
 
 ### 6.5 Retrieval boundary
 
@@ -353,11 +367,12 @@ Timeline assumes one or two people and access to one or two 80GB GPUs. Target th
 
 Minimal, cheap experiments that decide whether the project is viable.
 
-1. Pick two main targets from different families in the 4B–9B range with open weights and a standard tokenizer.
+1. Pick two main targets from different families in the 4B–9B range with open weights and a standard tokenizer. Gemma 3 4B-IT is the preferred family A because public SAEs cover every layer; it is kept if it shows B1 headroom.
 2. Build a 200-item B1 pilot from ECCO-TCP diplomatic text aligned with ECCO OCR or BLN600, split by work. Add 50 synthetic counterfactual items (unseen modern sentences converted with documented period spelling rules) to check contamination.
 3. Build a 150-item B3 pilot from ChroniclingAmericaQA raw-OCR records.
 4. Run C0/C1/C2 on both pilots for both models.
 5. Implement R1 on one or two layers for B1 and measure retention on 50 held-out items.
+6. Measure the split-half reliability of the candidate primary predictors on two pilot resamples, and fix the primary predictor by the preregistered rule.
 
 **Pass:** B1 modernization-error rate under C0 is high enough to matter (initial threshold: ≥ 10% of valid archaic tokens modernized); C1 reduces it by ≥ 30% relative; R1 retains ≥ 20% of that gain at any tier. B3 shows a significant C1 gain in evidence F1.
 
@@ -368,7 +383,7 @@ Minimal, cheap experiments that decide whether the project is viable.
 ### Phase 1: harness and reproduction (weeks 3–4)
 
 - Reproduce one Transmuting Prompts result on Gemma 3 1B (e.g. a translation or detox task) to validate the R1 implementation.
-- Implement R2, R4, R5, and R6, and the locality diagnostics.
+- Implement R2, R4, R5, and R6, the locality diagnostics (including necessity), and the edit–prompt alignment measures.
 - Implement the R3 editor harness: read, patch, revert, hash, and a bounded forward-pass API. Reproduce one released WSP edit if logs permit; otherwise document why not.
 - Freeze the data manifests and the discovery/validation/test splits by work and edition family.
 
@@ -378,7 +393,8 @@ Minimal, cheap experiments that decide whether the project is viable.
 
 - Full B1 data: about 100 discovery, 100 validation, 300 public test, and 300 held-out ECCO/newspaper test items.
 - All sources S1–S5 and all routes R1–R6 at three size tiers, on the first model family.
-- Locality diagnostics for B1.
+- Locality diagnostics for B1; prediction-track and routing-track R1 runs.
+- Factorial steering for B1.
 - Preservation suite and quantization check for the best edits.
 - Analysis of where the best gradient-free edit lives (rows, layers, directions).
 
@@ -390,6 +406,8 @@ Minimal, cheap experiments that decide whether the project is viable.
 - Repeat B1 and B3 on the second model family.
 - Locality–retention correlation analysis.
 - Training-Free GRPO as source S4 on B1 and B3 (secondary; drop if it produces no prompt gain).
+- Edit–prompt alignment for all accepted edits.
+- Optional SAE module on Gemma 3 4B-IT (B1 and B3, 2–3 fixed layers), only if Phases 0–2 are on schedule.
 
 **Deliverable:** the compilability-versus-locality figure, the paper's central result.
 
@@ -503,6 +521,17 @@ emnlp-hisfree/
 - Meng, K. et al. (2023). [MEMIT](https://arxiv.org/abs/2210.07229).
 - Ilharco, G. et al. (2023). [Task Arithmetic](https://arxiv.org/abs/2212.04089).
 - Turner, A. M. et al. (2023). [Activation Engineering](https://arxiv.org/abs/2308.10248).
+
+### Sparse autoencoders and feature-level analysis
+
+- Gao, L. et al. (2024). [Scaling and Evaluating Sparse Autoencoders](https://cdn.openai.com/papers/sparse-autoencoders.pdf).
+- He, Z. et al. (2024). [Llama Scope: Extracting Millions of Features from Llama-3.1-8B with Sparse Autoencoders](https://arxiv.org/abs/2410.20526).
+- Wang, M. et al. (2025). [Persona Features Control Emergent Misalignment](https://arxiv.org/abs/2506.19823) ([blog](https://openai.com/index/emergent-misalignment/)).
+- Dupré la Tour, T. and Mossing, D. (2025). [Debugging Misaligned Completions with Sparse-Autoencoder Latent Attribution](https://alignment.openai.com/sae-latent-attribution/).
+- Dupré la Tour, T. (2025). [Helpful Assistant Features Suppress Emergent Misalignment](https://alignment.openai.com/helpful-assistant-features/).
+- Google DeepMind (2025). [Gemma Scope 2](https://deepmind.google/blog/gemma-scope-2-helping-the-ai-safety-community-deepen-understanding-of-complex-language-model-behavior/).
+- Xu, X. et al. (2026). [Studying Metagaming Latents in Language Models](https://alignment.openai.com/metagaming-latents/).
+- Makelov, A. et al. (2026). [Training Activation Classifiers for Safety and Alignment](https://alignment.openai.com/training-activation-classifiers/) (supervised probes; related work only).
 - Cohen, R. et al. (2024). [RippleEdits](https://aclanthology.org/2024.tacl-1.16/).
 - Gupta, A. et al. (2024). [Model Editing at Scale Leads to Gradual and Catastrophic Forgetting](https://aclanthology.org/2024.findings-acl.902/).
 - Fang, J. et al. (2024). [AlphaEdit](https://arxiv.org/abs/2410.02355).

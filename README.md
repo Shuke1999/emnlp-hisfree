@@ -4,5 +4,5 @@ HisFree asks where historical reading lives in a modern LLM: for behaviors a mod
 
 ## Project documents
 
-- [Background and plan (v0.2)](BACKGROUND_AND_PLAN.md) — current framing, related work, and 14-week plan
-- [Experimental design (v0.2)](EXPERIMENT_DESIGN.md) — data construction, compilation routes, locality diagnostics, metrics, and the Phase 0 kill-test checklist
+- [Background and plan (v0.3)](BACKGROUND_AND_PLAN.md) — current framing, related work, and 14-week plan
+- [Experimental design (v0.3)](EXPERIMENT_DESIGN.md) — data construction, compilation routes, locality diagnostics, metrics, and the Phase 0 kill-test checklist

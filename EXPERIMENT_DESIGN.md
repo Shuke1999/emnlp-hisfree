@@ -1,8 +1,8 @@
 # HisFree Experimental Design
 
-**Version:** 0.2
+**Version:** 0.3
 
-**Date:** 10 November 2026
+**Date:** 11 November 2026
 
 **Companion document:** [BACKGROUND_AND_PLAN.md](BACKGROUND_AND_PLAN.md) v0.2. This design implements that plan. Section numbers like "Plan §6.3" refer to it.
 
@@ -28,9 +28,13 @@ Each hypothesis has a fixed test and threshold. Thresholds marked *pilot* may be
 | H2a | B1 compiles without gradients | Best gradient-free route (R1–R3) retention on B1 test, small or medium tier | ≥ 50%, beats all matched random edits (R6), passes preservation |
 | H2b | B3 compiles less | Best gradient-free retention on B3 minus on B1 | negative, CI excludes 0 |
 | H2c | Gradients compile both | R5 retention on B1 and B3 | ≥ 70% on both (*pilot*) |
-| H3 | Locality predicts compilability | Spearman ρ between the primary diagnostic L1 and best gradient-free retention across analysis units (§10.6) | ρ > 0, permutation p < 0.05, same sign on both families |
+| H3 | Locality predicts compilability | Spearman ρ between the primary diagnostic (chosen by the §10.7 rule) and **prediction-track** gradient-free retention (§9.2) across analysis units (§10.6) | ρ > 0, permutation p < 0.05, same sign on both families |
 | H4 | Short instructions compile better than TF-GRPO experience at matched gain | Retention(S1) − Retention(S4) under R1, restricted to pairs with prompt gains within 20% of each other | > 0 (secondary; reported only if S4 gives a significant prompt gain) |
 | H5 | B1 edit transfers and preserves | Retention on cross-corpus and counterfactual test; preservation gate (§11.4) | retention ≥ 30% cross-corpus; gate passed |
+| H6 | Diagnostic-guided routing improves compilation | R1 routing-track retention minus R1 prediction-track retention, per behavior and family (§9.2) | > 0, CI excludes 0 (secondary) |
+| H7 | Candidate mechanism of the B1 prompt effect (exploratory) | Factorial steering interactions and necessity tests (§10.8) | Descriptive; interpretation rules fixed in §10.8.1 before the runs |
+
+H2a, H2b, and H5 use the best route per cell, which is the routing track. H3 uses only the prediction track, so that the diagnostic being tested never chose the configuration whose success it is predicting.
 
 ## 3. Out of scope
 
@@ -73,7 +77,11 @@ Failing a gate is a result, not a reason to skip ahead. What to do on failure is
 | Family A main target | Open weights, 4B–9B, instruction-tuned, SwiGLU MLP with RMSNorm, untied or easily untied embeddings | All experiments |
 | Family B main target | Same criteria, different pretraining family and tokenizer | E3 onward; confirms that results are not architecture-specific |
 
-Candidate pairs: a Qwen-family model and a Llama- or Gemma-family model of similar size. The final choice is made in Phase 0 by two criteria: H1a headroom on the B1 pilot, and whether archaic and modern spellings tokenize into different token sequences (if they do not, R2 cannot target them).
+**Preferred family A: Gemma 3 4B-IT.** Gemma Scope 2 provides SAEs and transcoders for every layer of the Gemma 3 family, including the chat-tuned models, so the optional SAE module (§10.8.4) needs no SAE training. Gemma 3 4B also accepts images, which keeps a later page-image study within the same family, although this paper stays text-only. Gemma 3 is chosen if it passes H1a headroom on the B1 pilot; otherwise the next candidate with headroom is used and the SAE module is dropped.
+
+**Family B:** a Qwen-family model or Llama-3.1-8B-Instruct. The SAE module is not run on family B. Llama Scope covers every layer of Llama-3.1-8B, but its SAEs were trained on the Base model, so they are not treated as valid for the Instruct model in required experiments.
+
+Both choices are confirmed in Phase 0 by two criteria: H1a headroom on the B1 pilot, and whether archaic and modern spellings tokenize into different token sequences (if they do not, R2 cannot target them).
 
 Record for each target: model ID, revision hash, tokenizer hash, chat template, whether embeddings are tied, number of layers, hidden size, MLP width.
 
@@ -232,7 +240,9 @@ For each discovery input `x` and source `S`:
 2. Keep `y_P` only if it scores at least as well as the unprompted output `y_U` on the primary metric. These are the **validated targets**.
 3. Run the model teacher-forced on `(S + x, y_P)` and on `(x, y_P)`, and record at the positions of `y_P`, for every layer: residual stream, MLP input after RMSNorm, MLP output, and final hidden state.
 
-The prompted run is the teacher. Differences at aligned `y_P` positions define the prompt effect.
+The prompted run is the teacher. Differences at aligned `y_P` positions define the prompt effect. Because `y_P` is the prompted model's own validated output, the prompted branch is on-policy; only the unprompted branch is teacher-forced off-policy.
+
+4. **Unprompted on-policy pairs (supplementary).** For each discovery input, sample the unprompted model 8 times at temperature 0.7 and keep inputs that yield at least one behavior-positive output (e.g. archaic forms preserved) and at least one behavior-negative output. Report: the share of inputs that yield both classes; samples per input; and whether the two classes are matched in length, mean token log-probability, and the guard metrics. Any analysis on these pairs is repeated on a length- and confidence-matched subset, so that a found direction cannot simply reflect low confidence, long outputs, or unusual samples. These pairs are used for the mechanism analyses in §10.8, not for compilation.
 
 ### 9.2 Routes
 
@@ -242,15 +252,16 @@ The prompted run is the teacher. Differences at aligned `y_P` positions define t
 - Solve the ridge problem `ΔW = D Aᵀ (A Aᵀ + ρ I)⁻¹` for `W_up` and `W_gate`, and absorb the mean shift into `W_down` as in that paper's appendix.
 - Truncate `ΔW` to rank `r ∈ {1, 4, 16, 64}` by SVD, and scale by `η`.
 - Apply layer by layer from early to late, recollecting activations after each edited layer.
-- Layer sets: the single best layer by L1 (§10.1), the top-3 layers by L1, and all layers.
-- Hyperparameters `ρ`, `η`, `r`, and the layer set are chosen on validation within each size tier.
+- R1 runs in two tracks:
+  - **Prediction track:** a fixed configuration that never reads the locality diagnostics. Layer set fixed in advance as every layer in the middle third of the network; rank `r` fixed per size tier. Only `ρ` and `η` are tuned on validation. This track is used to test H3.
+  - **Routing track:** the layer set may be chosen by diagnostics (the single best layer by L1 (§10.1), the top-3 layers by L1, or all layers), with `ρ`, `η`, `r`, and the layer set tuned on validation within each size tier. This track is used for the main results and H6.
 
 **R2: closed-form token-row edit (B1 only).**
 
 - From discovery outputs, collect pairs `(a, m)` where gold has archaic form `a` and the unprompted model produced modern form `m`. Use the first differing token of each form.
 - Compute a historical-context direction `c` as the mean final hidden state on historical inputs minus the mean on modern inputs, both from unprompted runs.
 - For each pair, update the unembedding rows `u_a ← u_a + β ĉ` and `u_m ← u_m − β ĉ`, with `ĉ = c / ‖c‖`. This raises the archaic form's logit relative to the modern form in proportion to how historical the context looks.
-- Tied embeddings: untie and edit only the output matrix, and record that.
+- Tied embeddings (e.g. Gemma 3): keep the tied base matrix unchanged and add a sparse delta that acts only on the selected output rows at the unembedding step. Edit size counts only the changed rows. Before any edit, verify that the model with an all-zero delta produces logits identical to the original on 100 inputs. The delta may be materialized into an untied output matrix for export, but the stored edit size is still reported as the sparse row count.
 - `β` is chosen on validation.
 - Report retention separately on **seen pairs** (in discovery) and **unseen pairs**. Retention only on seen pairs means lexical memorization, not a general prior.
 
@@ -262,7 +273,7 @@ The prompted run is the teacher. Differences at aligned `y_P` positions define t
 - Not allowed: test data, internet, gradients, and repository paths outside the workspace.
 - Run on B1 for both families. Run on B3 for family A only, unless B3 R3 results differ meaningfully from R1.
 
-**R4: activation steering (non-persistent reference).** Add `α (mean h_P − mean h_U)` at layer `l` at every generated position. Choose `α` and `l` on validation. This is the upper reference for what a single fixed direction can do without changing weights.
+**R4: activation steering (non-persistent reference).** Add `α (mean h_P − mean h_U)` at layer `l` at every generated position. Choose `α` and `l` on validation. This is the upper reference for what a single fixed direction can do without changing weights. The same direction is used with both signs in the factorial mechanism experiment (§10.8.1).
 
 **R5: gradient-based context distillation (reference).**
 
@@ -292,7 +303,7 @@ All diagnostics are computed on **discovery data only**, from the paired activat
 
 Let `m(·)` be the mean teacher-forced log-probability of the validated targets `y_P`. This is used only for diagnostics.
 
-### 10.1 L1: layer concentration (primary predictor)
+### 10.1 L1: layer concentration (candidate primary predictor)
 
 For each layer `l`, run the unprompted model on `(x, y_P)` and replace the residual stream at the `y_P` positions with the prompted values at layer `l` only. Recovery:
 
@@ -308,9 +319,25 @@ Secondary summaries: `max_l r_l`, and the entropy of the normalized positive `r_
 
 At each layer, stack the per-position deltas `Δ_l = H_P,l − H_U,l` and compute the number of singular values needed for 90% of the squared Frobenius norm. L2 is the `r_l`-weighted mean over layers, normalized by hidden size. Lower means more concentrated.
 
-### 10.3 L3: component concentration
+### 10.3 L3: component sufficiency and necessity
 
-Rank MLP neurons and attention heads by `|mean activation delta| × ‖output weight column‖`. Patch the top-k components from the prompted run into the unprompted run, for k ∈ {8, 32, 128, 512}. L3 is the smallest k reaching 50% recovery, in log scale. Lower means more concentrated.
+MLP neurons and attention heads are different granularities, so they are ranked, patched, and reported **separately** and never merged into one ranking. Within each type, rank components by `|mean activation delta| × ‖output weight column‖`.
+
+**L3-S (sufficiency, candidate primary predictor).** Patch the top-k components from the prompted run into the unprompted run and measure recovery as in L1. Fixed k-grids:
+
+```text
+MLP neurons:     k ∈ {8, 32, 128, 512, 2048, 8192}
+attention heads: k ∈ {1, 2, 4, 8, 16, 32, 64}
+```
+
+Report, per type:
+
+- the normalized size `L3-S_50 = log(k_50 / N)`, where `k_50` is the smallest grid value reaching 50% recovery and `N` is the number of candidate components of that type in the model (if 50% is never reached, `k_50 = N`, flagged as censored);
+- the area under the recovery curve over the log-k grid.
+
+Lower `L3-S_50` and higher area mean more concentrated. Normalizing by `N` makes the measure comparable across families with different widths.
+
+**L3-N (necessity, secondary predictor).** In the **prompted** run, ablate the same top-k components (replace with their unprompted values) and measure how much of the prompt gain is lost. Report the loss curve over the same grids. A component set that is sufficient but not necessary indicates redundant routes to the behavior.
 
 ### 10.4 L4: token concentration (B1 and B2)
 
@@ -328,9 +355,92 @@ With only two or three behaviors and two models, a correlation across behaviors 
 - **B3:** clusters by OCR noise tercile, crossed with answerable or unanswerable.
 - **B2:** clusters by target word.
 
-Each cluster with at least 15 validation items and 15 test items is one unit. Expect about 20–30 units per model. H3 is tested on units with the primary predictor L1, with a permutation test that shuffles retention across units within each model. Behavior-level points are shown as well, but the claim rests on the unit-level test.
+Each cluster with at least 15 validation items and 15 test items is one unit. Expect about 20–30 units per model. H3 is tested on units with the primary predictor (§10.7) against prediction-track retention, with a permutation test that shuffles retention across units within each model. Behavior-level points are shown as well, but the claim rests on the unit-level test.
 
-L2–L5 are secondary, Holm-corrected.
+All other diagnostics are secondary, Holm-corrected. No composite or product of diagnostics is used as a predictor.
+
+### 10.7 Choosing the primary predictor
+
+L1 is easier to reproduce; L3-S (MLP neurons) is closer to the claim that a few components suffice. The choice is made by a fixed rule in Phase 0 that uses **only measurement stability**, never retention:
+
+1. Compute L1 and MLP-neuron `L3-S_50` on two independent resamples of the Phase 0 B1 and B3 pilot discovery data, per analysis unit.
+2. Compute split-half reliability (Spearman ρ across units between the two resamples) for each.
+3. If MLP-neuron `L3-S_50` has reliability ≥ 0.8 (*pilot*) and at most 20% censored units, it becomes the primary predictor; otherwise L1 is primary.
+
+The rule, both reliabilities, and the outcome are recorded in the Phase 0 memo before any main-split compilation run.
+
+### 10.8 Mechanism analyses
+
+These analyses explain results; they are not success criteria and do not feed into H2 or H3.
+
+#### 10.8.1 Factorial steering (B1, both families)
+
+Let `v` be the R4 prompt direction at its validated layer. Evaluate every combination of:
+
+| Factor | Levels |
+|---|---|
+| Prompt | none; S1 |
+| Steering | none; `+α v`; `−α v` |
+| Input | historical (B1 validation); modern (modern copy and spelling sets, §6.4) |
+| Instruction | default task; normalization-on-request ("modernize the spelling") |
+
+Fit a logistic mixed model on token-level archaic-form outcomes with item random effects, and test three interactions:
+
+- `steering × prompt`: does steering substitute for the prompt, or add to it?
+- `steering × historicalness`: does the direction act only on historical input?
+- `steering × instruction`: does the direction still force archaic forms when the user asks for modernization?
+
+Interpretation rules, fixed before the runs:
+
+| Pattern | Reading |
+|---|---|
+| `+v` works without the prompt and `−v` breaks the prompted behavior | A single causal direction is sufficient and necessary |
+| Effect present only on historical input, or switched off by the normalization instruction | Context-gated mechanism |
+| Effect equally strong on modern input | Global token or style bias, not historical reading |
+| `−v` effect clearly larger than `+v` | Candidate suppressive mechanism: the prompt mainly suppresses a default modernization tendency |
+
+These are labeled **candidate mechanisms**. Steering alone does not identify a mechanism. Whether suppression favors R2 and driving favors R1 is a hypothesis tested by comparing their retention, not a routing rule.
+
+#### 10.8.2 Necessity at the component level
+
+Reported from L3-N (§10.3) for B1 and B3 on both families.
+
+#### 10.8.3 Edit–prompt mechanism alignment
+
+For every accepted compiled model, compare per layer:
+
+```text
+Δ_P = h(prompted, original) − h(unprompted, original)
+Δ_E = h(unprompted, edited) − h(unprompted, original)
+```
+
+Report layer-wise cosine between mean `Δ_P` and mean `Δ_E`; principal-angle subspace overlap of their top-16 directions; per-position correlation of their norms; and how much of the edited model's gain is recovered by patching the edited activations at one layer into the original model. Do the same for R5 models.
+
+Interpretation:
+
+| Alignment | Generalization | Reading |
+|---|---|---|
+| High | Good | Mechanism replication |
+| Low | Good | Functional substitution |
+| Low | Seen pairs only | Shallow token shortcut |
+
+High alignment is **not** required for an edit to count as successful.
+
+#### 10.8.4 Optional SAE module (family A only)
+
+Run only if Gemma 3 4B-IT is family A and Phases 0–2 are on schedule.
+
+- Use Gemma Scope 2 SAEs at 2–3 layers fixed in advance (the layers with the highest L1 recovery for B1 on discovery data, chosen before compilation).
+- Behaviors: B1 and B3 only.
+- Repeat L3-S, L3-N, and §10.8.1 using SAE latents as the basis instead of raw neurons, with latents ranked by activation difference.
+- As an **attribution-assisted reference**, also rank latents by paired attribution difference (gradient of the output loss with respect to activations, projected on latent decoder directions, following OpenAI's SAE latent-attribution method), using the on-policy pairs of §9.1 step 4.
+- Report whether the zero-gradient raw-component diagnostics predict prediction-track retention as well as the attribution-assisted SAE diagnostics.
+
+SAE reconstruction error at each chosen layer is reported. The SAE module is not part of any core claim.
+
+#### 10.8.5 Use of gradients
+
+No compilation route R1–R4 computes gradients with respect to model parameters or uses an optimizer. All required diagnostics (L1–L5, L3-N, §10.8.1–10.8.3) are forward-only. The only gradients anywhere are activation gradients in the optional attribution-assisted reference (§10.8.4) and parameter gradients in R5, which is the gradient-based reference. The paper describes R1–R4 as **backprop-free, optimization-free weight compilation**.
 
 ## 11. Metrics
 
@@ -391,7 +501,8 @@ Per model family and behavior:
 | Block | Cells |
 |---|---|
 | Sources at inference | M0, S1, S2, S3, S4 (self, teacher), S5 |
-| Gradient-free compilation | R1 × {S1, S2, S4} × 3 tiers; R2 × S1 × 3 tiers (B1 only); R3 × S1 × 3 trajectories |
+| Gradient-free compilation | R1 × {prediction, routing track} × {S1, S2, S4} × 3 tiers; R2 × S1 × 3 tiers (B1 only); R3 × S1 × 3 trajectories |
+| Mechanism | Factorial steering (B1: 2 × 3 × 2 × 2 cells); L3-N; edit–prompt alignment for every accepted edit; optional SAE module (family A) |
 | References | R4 × S1; R5-full × S1 (off-policy and on-policy); R5-matched × S1 at the best R1 tier |
 | Controls | R6 × 5 for every accepted edit |
 | Complementarity | best compiled model + S1 at inference |
@@ -423,7 +534,8 @@ Week 2:
 6. Pick two families by H1a headroom and tokenization.
 7. Implement R1 on one and three layers for B1 on family A; measure retention on 50 held-out pilot items.
 8. Measure run-to-run variance of the preservation-suite validation slice to set the §11.4 tolerances.
-9. Write the go/no-go memo with all numbers and any threshold revisions.
+9. Apply the §10.7 rule: compute L1 and MLP-neuron L3-S reliability on two pilot resamples and fix the primary predictor.
+10. Write the go/no-go memo with all numbers, the primary-predictor decision, and any threshold revisions.
 
 **Go** if H1a, H1b, and H1c pass and R1 shows any retention above the matched random edit on B1. **No-go actions** are listed in Plan §8, Phase 0.
 
@@ -457,11 +569,14 @@ Released when licenses permit: evaluation code; data manifests and derived annot
 1. Headroom audit: ModErr and evidence F1 by view and prompt condition (C0–C2), both families.
 2. Source comparison S1–S5 at inference.
 3. Main result: retention by route (R1–R6) and tier, for B1 and B3, both families.
-4. **Central figure:** gradient-free retention against L1 per analysis unit, both families, with R5 retention shown as a reference band.
+4. **Central figure:** prediction-track gradient-free retention against the primary predictor per analysis unit, both families, with R5 retention shown as a reference band.
 5. Gradients versus capacity: R1 versus R5-matched versus R5-full.
-6. B1 edit localization: which layers, directions, and rows carry the edit; R2 seen-pair versus unseen-pair retention.
-7. Transfer: cross-corpus, cross-period, counterfactual.
-8. Preservation and false archaisms; normalization-on-request.
-9. Cost and edit size.
-10. Quantization robustness.
-11. No-edit outcomes and R3 trajectories.
+6. Prediction track versus routing track (H6).
+7. Factorial steering interactions for B1 and component necessity curves (L3-N).
+8. Edit–prompt mechanism alignment for R1, R2, R3, and R5 (replication, substitution, or shortcut).
+9. B1 edit localization: which layers, directions, and rows carry the edit; R2 seen-pair versus unseen-pair retention.
+10. Transfer: cross-corpus, cross-period, counterfactual.
+11. Preservation and false archaisms; normalization-on-request.
+12. Cost and edit size.
+13. Quantization robustness.
+14. No-edit outcomes and R3 trajectories.
